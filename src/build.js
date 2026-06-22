@@ -62,10 +62,17 @@ async function fetchCsv(routeShortName, serviceId) {
     .replace('{routeShortName}', routeShortName)
     .replace('{serviceId}', serviceId);
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
-    if (!res.ok) return null;
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(15000),
+      headers: { 'User-Agent': 'neary-gtfs/1.0 (https://github.com/ciotlosm/neary-gtfs)' },
+    });
+    if (!res.ok) {
+      if (res.status !== 404) LOG(`  ⚠ ${routeShortName}_${serviceId}: HTTP ${res.status}`);
+      return null;
+    }
     return await res.text();
-  } catch {
+  } catch (err) {
+    LOG(`  ⚠ ${routeShortName}_${serviceId}: ${err.message || err}`);
     return null;
   }
 }
@@ -106,6 +113,65 @@ function formatGtfsTime(seconds) {
   const m = Math.floor((seconds % 3600) / 60);
   const s = seconds % 60;
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+/** Haversine distance in meters between two lat/lon points. */
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/** Build a stop_id → {lat, lon} lookup from the stop registry. */
+const stopCoords = new Map(stopRegistry.stops.map(s => [s.stopId, { lat: s.lat, lon: s.lon }]));
+
+/**
+ * Interpolate stop times proportional to cumulative distance between stops.
+ * Falls back to even distribution if coordinates are missing.
+ *
+ * @param startSec - trip departure time in seconds since midnight
+ * @param stopSequence - ordered array of {stopId, sequence}
+ * @param avgSpeedKmh - average speed assumption (default 18 km/h for urban bus)
+ * @returns array of time-in-seconds per stop
+ */
+function interpolateStopTimes(startSec, stopSequence, avgSpeedKmh = 18) {
+  const numStops = stopSequence.length;
+  if (numStops <= 1) return [startSec];
+
+  // Compute cumulative distances
+  const cumDist = [0];
+  let totalDist = 0;
+  let allCoordsFound = true;
+
+  for (let i = 1; i < numStops; i++) {
+    const prev = stopCoords.get(stopSequence[i - 1].stopId);
+    const curr = stopCoords.get(stopSequence[i].stopId);
+    if (prev && curr) {
+      totalDist += haversineMeters(prev.lat, prev.lon, curr.lat, curr.lon);
+    } else {
+      allCoordsFound = false;
+      totalDist += 400; // fallback ~400m per stop gap
+    }
+    cumDist.push(totalDist);
+  }
+
+  // Total trip duration from distance + speed (capped at reasonable range)
+  const totalDurationSec = Math.round((totalDist / 1000 / avgSpeedKmh) * 3600);
+  // Minimum 1 min per stop, maximum 5 min per stop (sanity bounds)
+  const bounded = Math.max(numStops * 60, Math.min(numStops * 300, totalDurationSec));
+
+  // Distribute time proportionally to distance
+  const times = [];
+  for (let i = 0; i < numStops; i++) {
+    const fraction = totalDist > 0 ? cumDist[i] / totalDist : i / (numStops - 1);
+    times.push(startSec + Math.round(fraction * bounded));
+  }
+  return times;
 }
 
 function generateGtfs(allSchedules) {
@@ -155,15 +221,13 @@ function generateGtfs(allSchedules) {
 
       tripLines.push(`${routeId},${serviceId},${tripId},${headsign},${dir},${shapeId}`);
 
-      // Interpolate stop times across the trip
+      // Interpolate stop times using distance-proportional distribution
       const startSec = timeToSeconds(depTime);
       const numStops = stopSequence.length;
-      // Estimate ~2 min per stop (120 seconds) as default trip duration spread
-      const totalDurationSec = (numStops - 1) * 120;
+      const stopTimes = interpolateStopTimes(startSec, stopSequence);
 
       for (let i = 0; i < numStops; i++) {
-        const stopSec = startSec + Math.round((i / Math.max(numStops - 1, 1)) * totalDurationSec);
-        const timeStr = formatGtfsTime(stopSec);
+        const timeStr = formatGtfsTime(stopTimes[i]);
         stLines.push(`${tripId},${timeStr},${timeStr},${stopSequence[i].stopId},${i}`);
       }
     }
@@ -239,6 +303,7 @@ async function main() {
       const tripDir0 = tripRegistry.trips.find(t => t.routeId === route.routeId && t.directionId === 0);
       const tripDir1 = tripRegistry.trips.find(t => t.routeId === route.routeId && t.directionId === 1);
 
+      // Direction 0
       if (tripDir0 && stopTimesRegistry.stopTimes[tripDir0.tripId] && parsed.departures.dir0.length > 0) {
         allSchedules.push({
           routeId: route.routeId,
@@ -250,6 +315,7 @@ async function main() {
         });
       }
 
+      // Direction 1 (may not exist for circular/one-way routes)
       if (tripDir1 && stopTimesRegistry.stopTimes[tripDir1.tripId] && parsed.departures.dir1.length > 0) {
         allSchedules.push({
           routeId: route.routeId,
@@ -261,12 +327,32 @@ async function main() {
         });
       }
 
+      // Fallback: if no direction match in Tranzy trips but CSV has data,
+      // try using dir 0 for both columns (some routes are circular and only
+      // have a single trip in Tranzy but the CSV shows two columns)
+      if (!tripDir0 && !tripDir1 && (parsed.departures.dir0.length > 0 || parsed.departures.dir1.length > 0)) {
+        LOG(`  ⚠ Route ${route.shortName}: no trips in Tranzy registry, skipping`);
+      }
+
       fetched++;
     }
   }
 
   LOG(`Fetched ${fetched} CSVs, skipped ${skipped} (no data/errors)`);
   LOG(`Generated ${allSchedules.length} schedule entries (route × direction × service day)`);
+
+  // Task 4: Report which routes had no CSV data at all
+  const routesWithData = new Set(allSchedules.map(s => s.routeId));
+  const routesWithoutData = routeRegistry.routes.filter(r => !routesWithData.has(r.routeId));
+  if (routesWithoutData.length > 0) {
+    LOG(`Routes without schedule data (${routesWithoutData.length}):`);
+    for (const r of routesWithoutData) {
+      LOG(`  - ${r.shortName} (route_id=${r.routeId}) ${r.longName}`);
+    }
+    // Write to a file for CI visibility
+    const missingReport = routesWithoutData.map(r => `${r.shortName}\t${r.routeId}\t${r.longName}`).join('\n');
+    writeFileSync(join(outputDir, 'MISSING_ROUTES.txt'), `Routes without CSV schedule data:\n${missingReport}\n`);
+  }
 
   if (allSchedules.length === 0) {
     LOG('ERROR: No schedule data collected. Aborting.');
