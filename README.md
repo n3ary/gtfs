@@ -1,64 +1,49 @@
 # neary-gtfs
 
-GTFS static feed generator for transit agencies. Scrapes official schedule sources (CSV, PDF, or HTML — depending on the agency), builds standards-compliant GTFS ZIPs, and publishes them as GitHub Releases.
+Daily pipeline that syncs transit data from the Tranzy API and builds offline schedules from CTP Cluj CSV timetables. Publishes everything to the `releases` branch, served directly to the [neary](https://github.com/ciotlosm/neary) PWA via `raw.githubusercontent.com` (CORS-open, no proxy needed).
 
-**Consumer**: [neary](https://github.com/ciotlosm/neary) — the Netlify schedule pipeline fetches the ZIP URL from this repo's releases.
+## What it produces
 
-## Why
-
-Third-party GTFS feeds (like `external.gtfs.ro`) can go stale for months while operators publish updated schedules on their websites. This repo fills the gap by scraping directly from the official source and generating a compatible GTFS ZIP daily.
-
-## Architecture
-
-```
-neary-gtfs/
-├── agencies/
-│   └── 2/                          # Tranzy agency_id = 2 (CTP Cluj)
-│       ├── config.json             # Agency metadata + URL patterns
-│       ├── routes.json             # route_short_name → Tranzy route_id
-│       └── stops.json              # stop_name → Tranzy stop_id + coords
-├── src/
-│   └── build.js                    # Main build script (per-agency)
-├── .github/workflows/
-│   └── build-agency-2.yml         # Daily cron for CTP Cluj
-└── output/                         # Generated GTFS (gitignored)
-```
-
-## Adding a new agency
-
-1. Create `agencies/<tranzy_agency_id>/config.json` with the agency's URL patterns
-2. Populate `routes.json` and `stops.json` from the Tranzy API
-3. Create `.github/workflows/build-agency-<id>.yml` (copy from agency 2)
-4. The build script handles the rest
+| File | Source | Consumer |
+|------|--------|----------|
+| `data/<id>/routes.json` | Tranzy API | neary app (static data) |
+| `data/<id>/stops.json` | Tranzy API | neary app (static data) |
+| `data/<id>/trips.json` | Tranzy API | neary app (static data) |
+| `data/<id>/stop_times.json` | Tranzy API | neary app (static data) |
+| `data/<id>/shapes.json` | Tranzy API | neary app (static data) |
+| `data/agency.json` | Tranzy API | neary app (agency list) |
+| `data/hashes.json` | Computed | neary app (freshness check) |
+| `agency-2-schedule.json` | CTP CSV scrape | neary app (offline schedule) |
+| `agency-2-gtfs.zip` | CTP CSV scrape | GTFS validators/interop |
 
 ## How it works
 
-1. **Daily cron** (00:00 UTC) triggers the GitHub Action for each agency
-2. **Fetch**: download schedule data from the official source (CTP Cluj uses CSV files)
-3. **Parse**: extract departure times, directions, service days
-4. **Generate**: produce GTFS files using the route/stop registry for IDs and coordinates
-5. **Compare**: compute content hash and compare against the latest GitHub Release
-6. **Publish**: if changed, create a new release with the ZIP; if unchanged, exit 0 (no spam)
+A single GitHub Action runs daily at 00:00 UTC (or on manual trigger):
 
-### Change detection (no-spam publishing)
+1. **Sync** (`npm run sync`) — fetches all agencies' static data from the Tranzy API. Compares SHA-256 hashes against previous run; only writes changed files.
 
-The pipeline computes a SHA-256 hash of the generated GTFS content (normalized, sorted). This hash is stored in the body of each GitHub Release. On subsequent runs:
-- Download the latest release metadata (tag + body)
-- Extract the previous hash
-- If hashes match → no changes → skip publish (exit 0)
-- If hashes differ → publish a new release with the updated ZIP + new hash
+2. **Build** (`node src/build.js --agency 2`) — scrapes CTP Cluj CSV schedules, generates GTFS files + compact schedule JSON.
 
-No local state, no extra commits — the release itself is the single source of truth.
+3. **Publish** — pushes changed files to the `releases` branch. Creates a GitHub Release with the schedule ZIP (only if schedule hash changed).
 
-## GTFS format compatibility
+The neary app fetches from:
+```
+https://raw.githubusercontent.com/ciotlosm/neary-gtfs/releases/data/<id>/<endpoint>.json
+```
 
-The output is format-compatible with `external.gtfs.ro/cluj/CLUJ.zip`:
-- Same `trip_id` pattern: `<route_id>_<direction_id>_<service_id>_<seq>_<HHMM>`
-- Same `service_id` values: `LV`, `S`, `D`, `LD`
-- Same file set: `agency.txt`, `routes.txt`, `stops.txt`, `trips.txt`, `stop_times.txt`, `calendar.txt`
+## Structure
 
-This means the neary app's `agencyFeeds.ts` just needs its `feedUrl` updated from `external.gtfs.ro` to this repo's release asset URL — no pipeline code changes.
+```
+agencies/2/config.json       # CTP Cluj URL patterns + service day mappings
+src/sync-tranzy.js           # Syncs all agencies from Tranzy API
+src/build.js                 # Builds schedule from CTP CSV files
+.github/workflows/           # Daily pipeline
+```
+
+## Local development
+
+See [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## License
 
-Schedule data © CTP Cluj-Napoca. This tool generates derivative GTFS data for public transit information purposes.
+Schedule data © CTP Cluj-Napoca. Generated for public transit information purposes.
