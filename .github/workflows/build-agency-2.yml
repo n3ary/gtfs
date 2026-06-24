@@ -24,6 +24,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Sync Tranzy static data (all agencies)
+        run: node src/sync-tranzy.js
+        env:
+          TRANZY_API_KEY: ${{ secrets.TRANZY_API_KEY }}
+
       - name: Build GTFS for agency 2
         run: node src/build.js --agency 2
 
@@ -86,42 +91,59 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish to releases branch
-        if: steps.check.outputs.changed == 'true'
         run: |
-          HASH=$(cat output/agency-2/HASH)
           DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-          # Create the manifest
-          cat > /tmp/manifest.json << EOF
-          {
-            "agency-2": {
-              "name": "CTP Cluj-Napoca",
-              "version": "$DATE",
-              "hash": "$HASH",
-              "files": {
-                "schedule": "agency-2-schedule.json",
-                "gtfs": "agency-2-gtfs.zip"
-              }
-            }
-          }
-          EOF
 
           # Clone just the releases branch (orphan, shallow)
           git clone --single-branch --branch releases --depth 1 \
             "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" \
             /tmp/releases-branch
 
-          # Copy updated files
-          cp output/agency-2/agency-2-schedule.json /tmp/releases-branch/
-          cp output/agency-2/agency-2-gtfs.zip /tmp/releases-branch/
-          cp /tmp/manifest.json /tmp/releases-branch/manifest.json
+          # Always publish fresh static data from Tranzy sync
+          if [ -d "data" ]; then
+            mkdir -p /tmp/releases-branch/data
+            cp -r data/* /tmp/releases-branch/data/
+          fi
+
+          # Publish schedule artifacts only if changed
+          if [ "${{ steps.check.outputs.changed }}" = "true" ]; then
+            HASH=$(cat output/agency-2/HASH)
+            cp output/agency-2/agency-2-schedule.json /tmp/releases-branch/
+            cp output/agency-2/agency-2-gtfs.zip /tmp/releases-branch/
+
+            # Build manifest
+            cat > /tmp/releases-branch/manifest.json << EOF
+          {
+            "generatedAt": "$DATE",
+            "agencies": {
+              "2": {
+                "name": "CTP Cluj-Napoca",
+                "schedule": {
+                  "version": "$DATE",
+                  "hash": "$HASH",
+                  "file": "agency-2-schedule.json"
+                },
+                "static": {
+                  "routes": "data/2/routes.json",
+                  "stops": "data/2/stops.json",
+                  "trips": "data/2/trips.json",
+                  "stop_times": "data/2/stop_times.json",
+                  "shapes": "data/2/shapes.json"
+                }
+              }
+            }
+          }
+          EOF
+          fi
 
           # Commit and push
           cd /tmp/releases-branch
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "release: agency 2 schedule ($DATE)" || echo "No changes"
-          git push
+          git diff --cached --quiet && echo "No changes to publish" || {
+            git commit -m "release: sync static data + agency 2 schedule ($DATE)"
+            git push
+          }
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

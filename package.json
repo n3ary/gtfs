@@ -5,6 +5,7 @@
   "type": "module",
   "description": "GTFS static feed generator for transit agencies (CTP Cluj + extensible)",
   "scripts": {
+    "sync": "node src/sync-tranzy.js",
     "build": "node src/build.js",
     "build:agency": "node src/build.js --agency",
     "test": "vitest --run",
