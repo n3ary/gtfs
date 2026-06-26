@@ -1,25 +1,16 @@
 #!/usr/bin/env node
 
 /**
- * feeds/ctp-cluj/build.js — the only custom build script in neary-gtfs.
+ * feeds/cluj-napoca/build.js — the only custom build script in neary-gtfs.
  *
  * Pipeline:
- *   1. Fetch external.gtfs.ro/cluj/CLUJ.zip (the mdb-2121 mirror) as seed.
- *      Stable route/stop/shape structure; stale schedule.
+ *   1. Receive a seed GTFS .zip from src/pipeline/fetch-gtfs.js via
+ *      NEARY_SEED_ZIP (the Transitous-resolved Cluj-Napoca mirror).
  *   2. Scrape ctpcj.ro CSV timetables for every route × {LV,S,D}.
  *   3. REPLACE calendar.txt + trips.txt + stop_times.txt with our fresh
  *      schedule. KEEP agency/routes/stops/shapes.txt from the seed.
  *   4. Add feed_info.txt with neary-gtfs metadata.
- *   5. Re-pack the zip → outputs/feeds/ctp-cluj.gtfs.zip.
- *
- * Behaviour vs M0 (legacy src/build.js):
- *   - Source registry: CLUJ.zip seed (was Tranzy API + sync-tranzy.js)
- *   - Output location: outputs/feeds/ctp-cluj.gtfs.zip (was output/agency-2/*)
- *   - Drops compact-JSON output (v1-only consumer; v2 reads SQLite)
- *   - Drops HASH/CHANGED markers (the multi-feed pipeline does its own diff)
- *   - Drops MISSING_ROUTES.txt logging side-effect (routes-without-CSV are
- *     still skipped, just logged to stdout)
- *   - Adds feed_info.txt
+ *   5. Re-pack the zip → $NEARY_OUTPUT_ZIP (outputs/feeds/cluj-napoca.gtfs.zip).
  *
  * Output trip_ids match the canonical CTP format used by the
  * cluj-rt-feed.gtfs.ro GTFS-Realtime endpoints exactly:
@@ -40,7 +31,7 @@ const OUTPUTS = join(REPO_ROOT, 'outputs', 'feeds');
 const config = JSON.parse(readFileSync(join(FEED_DIR, 'config.json'), 'utf8'));
 const buildCfg = config.build;
 
-const LOG = (msg) => console.log(`[ctp-cluj] ${msg}`);
+const LOG = (msg) => console.log(`[cluj-napoca] ${msg}`);
 
 // The pipeline (fetch-gtfs.js) downloads the Transitous-resolved
 // Cluj-Napoca zip and passes its path here via NEARY_SEED_ZIP. When
@@ -85,7 +76,15 @@ async function fetchCsv(routeShortName, serviceKey) {
   try {
     const res = await fetch(url, {
       signal: AbortSignal.timeout(15000),
-      headers: { 'User-Agent': 'neary-gtfs/2.0 (https://github.com/ciotlosm/neary-gtfs)' },
+      headers: {
+        // ctpcj.ro's WAF rejects requests with non-browser-typical
+        // headers (returns 415 on GitHub Actions runners). Send a
+        // browser-like Accept set to bypass that rule. UA stays custom
+        // so we're identifiable in their logs.
+        'User-Agent': 'neary-gtfs/2.0 (https://github.com/ciotlosm/neary-gtfs)',
+        'Accept': 'text/csv,text/plain,*/*;q=0.8',
+        'Accept-Language': 'ro-RO,ro;q=0.9,en;q=0.8',
+      },
     });
     if (!res.ok) {
       if (res.status !== 404) LOG(`  ⚠ ${routeShortName}_${serviceKey}: HTTP ${res.status}`);
@@ -239,7 +238,7 @@ if (routesWithoutCsv.length > 0) {
 }
 
 if (allSchedules.length === 0) {
-  console.error('[ctp-cluj] FATAL: no schedule data collected');
+  console.error('[cluj-napoca] FATAL: no schedule data collected');
   process.exit(1);
 }
 
