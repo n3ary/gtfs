@@ -74,8 +74,13 @@ export async function fetchGtfs(feed) {
   if (feed.source.type === 'build' && feed.id === 'ctp-cluj') {
     buildCtpCluj();
   } else if (feed.source.type === 'transitous') {
-    const upstream =
-      feed.source.upstream_url ?? `${TRANSITOUS_GTFS_BASE}/${encodeURIComponent(feed.name)}.gtfs.zip`;
+    // Transitous's published GTFS zips follow the pattern
+    //   https://api.transitous.org/gtfs/<iso>_<source-name>.gtfs.zip
+    // (the prefix avoids name collisions across countries). The
+    // upstream `source.url` from ro.json points at the producer, not
+    // the canonical post-fix Transitous output — use the API URL.
+    const isoLower = (feed.country || '').toLowerCase();
+    const upstream = `${TRANSITOUS_GTFS_BASE}/${isoLower}_${encodeURIComponent(feed.name)}.gtfs.zip`;
     console.log(`[fetch-gtfs] ${feed.id} ← ${upstream}`);
     await fetchToFile(upstream, dest);
   } else if (feed.source.type === 'mobility-database') {

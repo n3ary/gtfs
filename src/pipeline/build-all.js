@@ -35,10 +35,10 @@ async function main() {
     try {
       const gtfs = await fetchGtfs(feed);
       const meta = deriveBbox(gtfs.localPath);
-      const sqlite = await makeSqlite(gtfs.localPath);
+      const sqlite = await makeSqlite(gtfs.localPath, feed.id);
       entries.push({ feed, gtfs, sqlite, ...meta });
       console.log(
-        `[build-all] ${feed.id}: bbox=[${meta.bbox.minLat},${meta.bbox.minLon}]..[${meta.bbox.maxLat},${meta.bbox.maxLon}], stops_zip=${(gtfs.sizeBytes / 1024).toFixed(1)}KB`,
+        `[build-all] ${feed.id}: bbox=[${meta.bbox.minLat},${meta.bbox.minLon}]..[${meta.bbox.maxLat},${meta.bbox.maxLon}], gtfs=${(gtfs.sizeBytes / 1024).toFixed(1)}KB sqlite_gz=${sqlite ? (sqlite.sizeBytes / 1024).toFixed(1) + 'KB' : 'n/a'}`,
       );
     } catch (err) {
       console.error(`[build-all] ${feed.id}: FAILED — ${err.message}`);

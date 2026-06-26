@@ -9,20 +9,27 @@ Daily pipeline producing GTFS feeds for the [neary](https://github.com/ciotlosm/
 > the remote (which v1 PWAs still consume) is left untouched.
 >
 > Roadmap: [neary docs/rebuild-v2/neary-gtfs-plan.md §10](https://github.com/ciotlosm/neary/blob/rebuild/v2-svelte-sqlite/docs/rebuild-v2/neary-gtfs-plan.md#10-evolution-roadmap)
-> (M0 → M5). Current milestone: **M1+** — scaffold + Tranzy removal.
+> (M0 → M5). Current milestone: **M2** — SQLite generation + first
+> Transitous-mirrored feed (Bucharest).
 
 ## What it produces
 
 Published to the `binaries-staging` branch by
-[`.github/workflows/daily.yml`](.github/workflows/daily.yml):
+[`.github/workflows/daily.yml`](.github/workflows/daily.yml)
+(promotes to `binaries` once CI is verified end-to-end):
 
 | File | Source | Consumer |
 |------|--------|----------|
 | `feeds.json` | new pipeline | neary v2 app (single registry) |
-| `feeds/ctp-cluj.gtfs.zip` | `feeds/ctp-cluj/build.js` (CTP CSV enhance of CLUJ.zip seed) | neary v2 app + GTFS validators |
+| `feeds/<feedId>.gtfs.zip` | local build (ctp-cluj) / `api.transitous.org/gtfs/<iso>_<name>.gtfs.zip` (mirrored) | external validators |
+| `feeds/<feedId>.sqlite3.gz` | `make-sqlite.js` | neary v2 app (OPFS) |
 
-`feeds.json` is schema-validated at build time
-([`schemas/feeds.schema.json`](schemas/feeds.schema.json), draft-2020).
+Current feeds (verified locally):
+
+| id | source | gtfs.zip | sqlite3.gz | rows |
+|---|---|---:|---:|---|
+| `ctp-cluj` | local CSV enhance | 1.7 MB | 5.4 MB | 14k trips · 193k stop_times · 70k shape pts |
+| `bucuresti-ilfov` | Transitous mirror | 7.8 MB | 25 MB | 63k trips · 1.33M stop_times · 82k shape pts |
 
 ## How it works
 
@@ -30,14 +37,15 @@ Published to the `binaries-staging` branch by
 daily import) or on manual trigger:
 
 1. **Pipeline** (`npm run pipeline`):
-   - `resolve-feeds.js` — `countries.json` + Transitous `feeds/<iso>.json`
-     → feed list (M1 emits only `ctp-cluj`; `RESOLVE_INCLUDE_TRANSITOUS=true`
-     opts into the multi-feed path landing in M2)
+   - `resolve-feeds.js` — `countries.json` (countries + `include`
+     whitelist) + Transitous `feeds/<iso>.json` → feed list. ctp-cluj
+     is always prepended.
    - `fetch-gtfs.js` — for `ctp-cluj`: invoke `feeds/ctp-cluj/build.js`;
-     for Transitous feeds: download from `api.transitous.org/gtfs/...`
+     for Transitous feeds: download from
+     `api.transitous.org/gtfs/<iso>_<name>.gtfs.zip`
    - `derive-bbox.js` — extract `stops.txt`/`agency.txt`/`feed_info.txt`
      via `unzip -p`
-   - `make-sqlite.js` — stub (M2 ports the SQLite generator)
+   - `make-sqlite.js` — convert .zip → .sqlite3.gz (per-feed)
    - `make-app-registry.js` — write `outputs/feeds.json`, Ajv-validate
 2. **GTFS validator** — canonical MobilityData validator; fails on any ERROR
 3. **Publish** — push `outputs/` → `binaries-staging` branch
@@ -62,14 +70,14 @@ M2 will rename the publish branch to `binaries` and put jsDelivr in front.
 
 ## Structure
 
-```
-countries.json                  # ISO codes whose Transitous feeds we mirror
+```{ countries: [iso], include: [transitous source names] }
 schemas/feeds.schema.json       # JSON Schema (draft-2020) for outputs/feeds.json
 src/pipeline/
   build-all.js                  # orchestrator (npm run pipeline)
   resolve-feeds.js              # countries.json + Transitous → feed list
   fetch-gtfs.js                 # build local or fetch upstream
   derive-bbox.js                # zip → bbox + agencies + validity
+  make-sqlite.js                # zip → .sqlite3.gz (per-feed)box + agencies + validity
   make-sqlite.js                # M2 stub
   make-app-registry.js          # → outputs/feeds.json (Ajv-validated)
   _smoke.js                     # local end-to-end check (no CI)

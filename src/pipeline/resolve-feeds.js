@@ -105,17 +105,18 @@ function projectTransitousFeed(iso, raw) {
 
 /**
  * @returns {Promise<Array<object>>} resolved feeds in build order.
- *   ctp-cluj is always first; Transitous entries follow.
+ *   ctp-cluj is always first; Transitous entries (filtered by the
+ *   `include` whitelist in countries.json) follow.
  */
 export async function resolveFeeds() {
   const config = JSON.parse(readFileSync(join(ROOT, 'countries.json'), 'utf8'));
   const countries = config.countries ?? [];
-  const includeTransitous = process.env.RESOLVE_INCLUDE_TRANSITOUS === 'true';
+  const includeWhitelist = new Set(config.include ?? []);
 
   const feeds = [CTP_CLUJ_FEED];
 
-  if (!includeTransitous) {
-    console.log('[resolve-feeds] M1 mode: ctp-cluj only (set RESOLVE_INCLUDE_TRANSITOUS=true to mirror Transitous).');
+  if (includeWhitelist.size === 0) {
+    console.log('[resolve-feeds] no Transitous includes whitelisted; ctp-cluj only.');
     return feeds;
   }
 
@@ -128,22 +129,22 @@ export async function resolveFeeds() {
       continue;
     }
     const sources = Array.isArray(payload.sources) ? payload.sources : [];
+    const seen = new Set();
     for (const raw of sources) {
+      if (!includeWhitelist.has(raw.name)) continue;
       const projected = projectTransitousFeed(iso, raw);
       if (projected.skip) {
-        console.warn(`[resolve-feeds] ${iso}/${raw.name ?? '?'}: skipped (${projected.skip})`);
+        console.warn(`[resolve-feeds] ${iso}/${raw.name}: skipped (${projected.skip})`);
         continue;
       }
-      // De-duplicate: a Cluj-published-via-Transitous entry shouldn't double
-      // when our own ctp-cluj is already in the list.
-      if (projected.feed.id === 'ctp-cluj' || projected.feed.id.startsWith('cluj-napoca')) {
-        console.log(`[resolve-feeds] ${iso}/${raw.name}: skipped (overlaps our own ctp-cluj feed)`);
-        continue;
-      }
+      // De-dup: a whitelisted name appearing multiple times (e.g. with a
+      // separate gtfs-rt sibling) shouldn't double-emit.
+      if (seen.has(projected.feed.id)) continue;
+      seen.add(projected.feed.id);
       feeds.push(projected.feed);
     }
   }
 
-  console.log(`[resolve-feeds] resolved ${feeds.length} feed(s).`);
+  console.log(`[resolve-feeds] resolved ${feeds.length} feed(s): ${feeds.map((f) => f.id).join(', ')}`);
   return feeds;
 }

@@ -1,4 +1,5 @@
 {
-  "_comment": "ISO 3166-1 alpha-2 country codes whose Transitous feeds we mirror into our app-facing registry. Initial scope is ['ro']; expand once we have demand and disk-budget room.",
-  "countries": ["ro"]
+  "_comment": "ISO 3166-1 alpha-2 country codes whose Transitous feeds we mirror, plus an 'include' whitelist of source names to actually publish. ctp-cluj is always included (built locally).",
+  "countries": ["ro"],
+  "include": ["Bucuresti-Ilfov"]
 }
