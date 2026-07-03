@@ -44,7 +44,11 @@ jobs:
         uses: pnpm/action-setup@v4
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        # --trust-lockfile: the lockfile is part of the source tree and
+        # goes through PR review. We don't need pnpm 11's supply-chain
+        # re-verification step (which can reject fresh publishes within
+        # 24h of their release) blocking CI for lockfile-only diffs.
+        run: pnpm install --frozen-lockfile --trust-lockfile
 
       - name: Build packages
         run: pnpm build
