@@ -36,33 +36,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Node
-        uses: actions/setup-node@v6.4.0
+      - name: Setup pnpm with GH Packages auth + install
+        # Replaces the previous manual checkout+node+pnpm+HOME-scoped
+        # .npmrc+pnpm install. The cluj adapter's `clujStaticExtension`
+        # is a published @n3ary/* dep; pnpm reads auth from ~/.npmrc.
+        uses: n3ary/actions/.github/actions/setup-pnpm-gh-packages-auth@v11
         with:
-          node-version: 24
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v6.0.9
-
-      - name: Install dependencies
-        # --trust-lockfile: the lockfile is part of the source tree and
-        # goes through PR review. We don't need pnpm 11's supply-chain
-        # re-verification step (which can reject fresh publishes within
-        # 24h of their release) blocking CI for lockfile-only diffs.
-        #
-        # NODE_AUTH_TOKEN + HOME-scoped .npmrc lets pnpm fetch
-        # @n3ary/* deps from GH Packages (the cluj adapter's
-        # `clujStaticExtension` is now a published dep).
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          HOME: ${{ runner.temp }}/gtfs-daily-clean-home
-        run: |
-          mkdir -p "$HOME"
-          {
-            echo "@n3ary:registry=https://npm.pkg.github.com"
-            echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}"
-          } > "$HOME/.npmrc"
-          pnpm install --frozen-lockfile --trust-lockfile
+          auth-token: ${{ secrets.NPM_TOKEN }}
 
       - name: Build packages
         run: pnpm build

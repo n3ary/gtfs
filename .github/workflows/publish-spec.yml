@@ -4,7 +4,7 @@ name: Publish @n3ary/gtfs-spec
 #
 # Triggers:
 #   - workflow_dispatch with a `version` input (e.g. "0.1.0", "0.2.0-rc.1").
-#     Bumps the package.json version, commits, tags, publishes.
+#     Bumps packages/spec/package.json, commits, tags, publishes.
 #   - push of a tag matching packages/spec/v* — publish that exact version.
 #
 # The package is PUBLIC on GitHub Packages (set via `access: public` in
@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to publish (e.g. 0.1.0, 0.2.0-rc.1). Leave blank to publish the current package.json version as-is.'
+        description: 'Version to publish (e.g. 0.1.0). Blank uses current.'
         required: false
         type: string
   push:
@@ -44,35 +44,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Node
-        uses: actions/setup-node@v6.4.0
+      - name: Setup pnpm with GH Packages auth + install
+        # The workspace's pnpm-lock.yaml references
+        # @n3ary/gtfs-adapter-cluj-napoca (a private package on GH
+        # Packages) as a dev-dep of the gtfs-static package. pnpm reads
+        # auth from ~/.npmrc; without it, `pnpm install` 401s on that
+        # tarball.
+        uses: n3ary/actions/.github/actions/setup-pnpm-gh-packages-auth@v11
         with:
-          node-version: 24
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v6.0.9
-
-      - name: Install dependencies
-        # --trust-lockfile: the lockfile is part of the source tree
-        # and goes through PR review. Skips pnpm 11's supply-chain
-        # re-verification (which can reject fresh publishes within 24h).
-        #
-        # NODE_AUTH_TOKEN + HOME-scoped .npmrc: the workspace's
-        # pnpm-lock.yaml references @n3ary/gtfs-adapter-cluj-napoca
-        # (a private package on GH Packages) as a dev-dep of the
-        # gtfs-static package. Without auth, `pnpm install` 401s
-        # on that tarball. Mirror the same HOME-scoped pattern from
-        # daily.yml + pr-validation.yml.
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          HOME: ${{ runner.temp }}/publish-spec-clean-home
-        run: |
-          mkdir -p "$HOME"
-          {
-            echo "@n3ary:registry=https://npm.pkg.github.com"
-            echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}"
-          } > "$HOME/.npmrc"
-          pnpm install --frozen-lockfile --trust-lockfile
+          auth-token: ${{ secrets.NPM_TOKEN }}
 
       - name: Build packages
         run: pnpm build
@@ -82,36 +62,19 @@ jobs:
 
       - name: Set version
         id: set-version
-        # workflow_dispatch + version input → bump package.json + tag.
-        # Tag push → use the version already in the tag.
-        # No version input → publish whatever is in package.json.
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
-        run: |
-          VERSION="${{ github.event.inputs.version }}"
-          # Validate version format (semver-ish; prerelease ok)
-          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
-            echo "::error::Invalid version format: $VERSION (expected e.g. 0.1.0 or 0.2.0-rc.1)"
-            exit 1
-          fi
-          cd packages/spec
-          CURRENT=$(node -p "require('./package.json').version")
-          if [ "$CURRENT" != "$VERSION" ]; then
-            # Bump + commit + tag + push. The next 'Publish' step reads
-            # the updated package.json so the version field is current.
-            npm version "$VERSION" --no-git-tag-version
-            cd ../..
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add packages/spec/package.json
-            git commit -m "chore(release): @n3ary/gtfs-spec v${VERSION}"
-            git tag "packages/spec/v${VERSION}"
-            git push origin "packages/spec/v${VERSION}" --no-verify
-            git push origin HEAD --no-verify
-            echo "Bumped: $CURRENT → $VERSION"
-          else
-            echo "Version already at $VERSION — skipping bump"
-          fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        # workflow_dispatch + version input -> bump package.json + tag.
+        # Tag push -> use the version already in the tag.
+        # No version input -> publish whatever is in package.json.
+        if: >
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.version != ''
+        uses: n3ary/actions/.github/actions/version-bump@v12
+          with:
+        with:
+          version-input: ${{ github.event.inputs.version }}
+          package-dir: packages/spec
+          tag-name: packages/spec/v{version}
+          commit-message-override: 'chore(release): @n3ary/gtfs-spec v{version}'
 
       - name: Publish to GitHub Packages
         # Always builds the latest spec/ contents and publishes. The
