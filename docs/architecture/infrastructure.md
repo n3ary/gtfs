@@ -16,7 +16,7 @@ flowchart TB
     transitous_raw["Transitous country manifests<br/>raw.githubusercontent.com/<br/>public-transport/transitous/main/feeds/&lt;iso&gt;.json"]:::src
     transitous_api["Transitous GTFS API<br/>api.transitous.org/gtfs/&lt;iso&gt;_&lt;name&gt;.gtfs.zip"]:::src
     mdb["MobilityData catalog (via GitHub)<br/>api.github.com + raw.githubusercontent.com<br/>resolves mdb-id → direct RT URL"]:::src
-    sister["Sister adapters<br/>e.g. cluj-napoca-gtfs-adapter<br/>(remote-sourced zips, declared via<br/>feeds/&lt;id&gt;/config.json source.url)"]:::src
+    sister["Sister adapters<br/>e.g. the cluj adapter in gtfs-adapters<br/>(remote-sourced zips, declared via<br/>feeds/&lt;id&gt;/config.json source.url)"]:::src
   end
 
   subgraph GitHub["GitHub Actions"]
@@ -64,7 +64,7 @@ flowchart TB
 | **Transitous country manifests** (`raw.githubusercontent.com/public-transport/transitous/main/feeds/<iso>.json`) | Per-country source list with `name` + `spec` + `mdb-id` etc. | Transitous (via GitHub raw) | Free | Most feeds missing |
 | **Transitous GTFS API** (`api.transitous.org/gtfs/<iso>_<name>.gtfs.zip`) | The actual `.gtfs.zip` download for plain-mirror feeds | Transitous | Free | Most feeds missing |
 | **MobilityData catalog** (via `api.github.com` git tree + `raw.githubusercontent.com/...mobility-database-catalogs/main/`) | Resolves Transitous `mdb-id`s into direct RT URLs (`vehicle_positions`, `trip_updates`, `service_alerts`); the resolved URLs get stamped into `feeds.json` | MobilityData (via GitHub) | Free; honors `GITHUB_TOKEN` for higher rate limit | RT URLs missing or wrong in the published `feeds.json` |
-| **Sister adapter zips** (e.g. [cluj-napoca-gtfs-adapter](https://github.com/n3ary/cluj-napoca-gtfs-adapter)) | Reconciled GTFS zip for specific feeds; consumed via `feeds/<id>/config.json` `source.type=remote` pointing at `source.url` | Each adapter's repo | (their infra) | Feeds sourced from that adapter stale |
+| **Sister adapter zips** (e.g. [gtfs-adapters/cluj-napoca](https://github.com/n3ary/gtfs-adapters/tree/main/adapters/cluj-napoca)) | Reconciled GTFS zip for specific feeds; consumed via `feeds/<id>/config.json` `source.type=remote` pointing at `source.url` | Each adapter's repo | (their infra) | Feeds sourced from that adapter stale |
 | **n3ary/app** (sister repo, formerly `ciotlosm/neary`) | Consumer of the published artifacts | [n3ary/app repo](https://github.com/n3ary/app) | (its own infra) | Data freshness signal missing |
 
 ## Secrets + variables (GitHub repo settings)
