@@ -35,34 +35,16 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup Node
-        uses: actions/setup-node@v6.4.0
+      - name: Setup pnpm with GH Packages auth + install
+        # Replaces the previous ~25-line manual setup (checkout +
+        # setup-node + setup-pnpm + HOME-scoped .npmrc + pnpm
+        # install). --trust-lockfile: pnpm 11's supply-chain
+        # re-verification can reject fresh publishes within 24h of
+        # their release; we don't need that since the lockfile is
+        # source-tree and goes through PR review.
+        uses: n3ary/actions/.github/actions/setup-pnpm-gh-packages-auth@v11
         with:
-          node-version: 24
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v6.0.9
-
-      - name: Install dependencies
-        # --trust-lockfile: the lockfile is part of the source tree and
-        # goes through PR review. We don't need pnpm 11's supply-chain
-        # re-verification step (which can reject fresh publishes within
-        # 24h of their release) blocking CI for lockfile-only diffs.
-        #
-        # NODE_AUTH_TOKEN gets baked into a HOME-scoped .npmrc so pnpm
-        # can fetch @n3ary/* deps published to GH Packages (e.g.
-        # @n3ary/gtfs-adapter-cluj-napoca). The repo's committed .npmrc
-        # only declares scope mapping; token wiring is here.
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          HOME: ${{ runner.temp }}/gtfs-publisher-pr-clean-home
-        run: |
-          mkdir -p "$HOME"
-          {
-            echo "@n3ary:registry=https://npm.pkg.github.com"
-            echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}"
-          } > "$HOME/.npmrc"
-          pnpm install --frozen-lockfile --trust-lockfile
+          auth-token: ${{ secrets.NPM_TOKEN }}
 
       - name: Build packages
         run: pnpm build
@@ -140,15 +122,8 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup Node
-        # The version-bump action invokes `npm version` to bump
-        # package.json#version, which needs npm on PATH.
-        uses: actions/setup-node@v6.4.0
-        with:
-          node-version: 24
-
       - name: Auto-bump version to main + 1
-        uses: n3ary/actions/.github/actions/version-bump@v3
+        uses: n3ary/actions/.github/actions/version-bump@v12
         with:
           # Skip the bump when the PR touches only docs/, .github/,
           # .gitignore, or LICENSE. (default already covers .github/,
