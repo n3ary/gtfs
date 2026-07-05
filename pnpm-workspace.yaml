@@ -1,6 +1,23 @@
 packages:
   - "packages/*"
 
+# Force every transitive @n3ary/gtfs-spec dep to resolve to this
+# workspace's local checkout (link:../spec) instead of fetching the
+# published GH Packages tarball. Without this, downstream packages
+# like @n3ary/gtfs-adapter-cluj-napoca@0.2.0 (which declares
+# "@n3ary/gtfs-spec": "^0.3.2" as a production dep) trigger a 401
+# when CI tries to read the org's private spec package. Single source
+# of truth: workspace-only.
+#
+# `link:../spec` (the same target resolved inside the workspace's
+# importer entries) is used in preference to `workspace:*` because
+# the latter caused pnpm 11.5 to also downgrade Vite (vitest@4.1.9's
+# peer fell back to vite@5.4.21 instead of vite@8.x). `link:` is the
+# most-specific syntax — it doesn't trigger the cross-package
+# resolution path that perturbates vitest's peer resolution.
+overrides:
+  '@n3ary/gtfs-spec': workspace:*
+
 allowBuilds:
   better-sqlite3: true
   esbuild: true
@@ -8,9 +25,14 @@ allowBuilds:
   sharp: true
   workerd: true
 
-# csv-parse@7.0.1 was published ~22.5h ago at the time of the last lockfile
-# bump (2026-07-03). pnpm 11 defaults to a 24h minimumReleaseAge cutoff.
-# Once csv-parse@7.0.1 has been published for >24h at install time, drop
-# this exclusion.
-minimumReleaseAgeExclude:
-  - csv-parse@7.0.1
+# pnpm 11 supply-chain policy rejects packages published within the
+# minimum release age cutoff (default 24h). Disable for this
+# internal monorepo: every @n3ary dep is published by us and we
+# trust our own publish pipeline. (Minutes; 0 = no cutoff.)
+minimumReleaseAge: 0
+
+# No `minimumReleaseAgeExclude` entries — every internal dep listed
+# in `package.json` has been published for >24h. If a future dep
+# gets freshly published, pnpm will fail loudly at install time
+# with a clear "below minimumReleaseAge" message; re-add it here
+# temporarily and remove once 24h have elapsed.

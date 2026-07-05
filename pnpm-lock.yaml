@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  '@n3ary/gtfs-spec': workspace:*
+
 importers:
 
   .:
@@ -54,6 +57,9 @@ importers:
 
   packages/gtfs-static:
     dependencies:
+      '@n3ary/gtfs-adapter-cluj-napoca':
+        specifier: 0.2.3
+        version: 0.2.3(better-sqlite3@12.11.1)
       '@n3ary/gtfs-spec':
         specifier: workspace:*
         version: link:../spec
@@ -76,6 +82,9 @@ importers:
         specifier: ^1.15.0
         version: 1.15.0
     devDependencies:
+      '@types/archiver':
+        specifier: ^8.0.0
+        version: 8.0.0
       '@types/better-sqlite3':
         specifier: ^7.6.13
         version: 7.6.13
@@ -458,6 +467,13 @@ packages:
     resolution: {integrity: sha512-TuB0x50EoAvEX/UEWITd8Mkn3WhiTjSvbTMCLj0BhsQEl5iUzjXdA0bETEVpTk+5TGTLR6QktI9H4hLviVeaAQ==}
     engines: {node: '>=v12.0.0'}
 
+  '@n3ary/gtfs-adapter-cluj-napoca@0.2.3':
+    resolution: {integrity: sha512-0e53xmhwu8v7y8JILaNWTM7Akcp0eN2/T3HewFRqfVpy+jSVMOnHpwx7Au3bEVXZY/VU7B8pY4WfIrOdpNWSBA==, tarball: https://npm.pkg.github.com/download/@n3ary/gtfs-adapter-cluj-napoca/0.2.3/46946a886976f0e7f068f1ac7d92b01a7b174599}
+    engines: {node: '>=24'}
+    hasBin: true
+    peerDependencies:
+      better-sqlite3: ^12.11.1
+
   '@napi-rs/wasm-runtime@1.1.6':
     resolution: {integrity: sha512-ZLv/JdUfkvOy9eCnnBaGfiO+XimbjebAeO+MRQqD/B+FR1tnRN0tpKSJHRbE8sFfS6aqsXZ67TQjfwfsxULVbg==}
     peerDependencies:
@@ -739,6 +755,9 @@ packages:
   '@tybys/wasm-util@0.10.3':
     resolution: {integrity: sha512-F3fo1MYrRJYL3zER0OUOmkutjr1Vp23m7OsSgp7nq4SP6OqX6C/56XFIPAl5bt3zaBRjmW7SGz3u/6LwFpYcOg==}
 
+  '@types/archiver@8.0.0':
+    resolution: {integrity: sha512-YpXPbEuv9+eUIPPQWUPahj3cvs9isWRuF+J4z+KbdYVDO3rWorWQFxUVHnwPu2AgKwvgpki5F2VMX0Xx+mX45A==}
+
   '@types/better-sqlite3@7.6.13':
     resolution: {integrity: sha512-NMv9ASNARoKksWtsq/SHakpYAYnhBrQgGD8zkLYk/jaK8jUGn08CfEdTRgYhMypUQAfzSP8W6gNLe0q19/t4VA==}
 
@@ -765,6 +784,9 @@ packages:
 
   '@types/node@26.1.0':
     resolution: {integrity: sha512-O0A1G3xPGy4w7AgQdAQYUlQ+BKk2Oovw8eRpofyp5KdBZULnbe+WqaOVNrm705SHphCiG4XHsACrSmPu1f+Kgw==}
+
+  '@types/readdir-glob@1.1.5':
+    resolution: {integrity: sha512-raiuEPUYqXu+nvtY2Pe8s8FEmZ3x5yAH4VkLdihcPdalvsHltomrRC9BzuStrJ9yk06470hS0Crw0f1pXqD+Hg==}
 
   '@vitest/expect@2.1.9':
     resolution: {integrity: sha512-UJCIkTBenHeKT1TTlKMJWy1laZewsRIzYighyYiJKZreqtdxSos/S1t+ktRMQWu2CKqaarrkeszJx1cgC5tGZw==}
@@ -2150,6 +2172,17 @@ snapshots:
     dependencies:
       lodash: 4.18.1
 
+  '@n3ary/gtfs-adapter-cluj-napoca@0.2.3(better-sqlite3@12.11.1)':
+    dependencies:
+      '@n3ary/gtfs-spec': link:packages/spec
+      archiver: 8.0.0
+      better-sqlite3: 12.11.1
+      gtfs-realtime-bindings: 1.1.1
+    transitivePeerDependencies:
+      - bare-abort-controller
+      - bare-buffer
+      - react-native-b4a
+
   '@napi-rs/wasm-runtime@1.1.6(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.1)':
     dependencies:
       '@emnapi/core': 1.11.1
@@ -2314,6 +2347,11 @@ snapshots:
       tslib: 2.8.1
     optional: true
 
+  '@types/archiver@8.0.0':
+    dependencies:
+      '@types/node': 26.1.0
+      '@types/readdir-glob': 1.1.5
+
   '@types/better-sqlite3@7.6.13':
     dependencies:
       '@types/node': 26.1.0
@@ -2343,6 +2381,10 @@ snapshots:
   '@types/node@26.1.0':
     dependencies:
       undici-types: 8.3.0
+
+  '@types/readdir-glob@1.1.5':
+    dependencies:
+      '@types/node': 26.1.0
 
   '@vitest/expect@2.1.9':
     dependencies:

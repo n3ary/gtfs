@@ -7,11 +7,13 @@
  *   - a **plain mirror** of Transitous's resolved zip (default), OR
  *   - a **remote-sourced feed** if a `feeds/<id>/config.json` declares
  *     `enhances: "<TransitousName>"` and a `source.type === "remote"`
- *     pointing at a fully pre-built GTFS zip in another repo
- *     (e.g. cluj-napoca-gtfs-adapter).
+ *     pointing at a fully pre-built GTFS zip in another repo, OR
+ *   - an **adapter-driven feed** if a `feeds/<id>/config.json` declares
+ *     `source.type === "adapter"` and a `source.publisher` naming the
+ *     adapter package (e.g. `@n3ary/gtfs-adapter-<feed>`).
  *
  * The override file may also overlay realtime / license / metadata
- * fields on top of either kind of base.
+ * fields on top of any kind of base.
  *
  * Local feed dirs without an `enhances` value (or whose `enhances`
  * doesn't match anything in `include[]`) are warned about and skipped.
@@ -122,21 +124,33 @@ function projectFeed(iso: string, raw: RawTransitousSource, override: Override |
     smoke?: { expectedPublisher?: string; tripIdPattern?: string };
   };
 
-  // The only non-transitous source type currently supported is "remote".
-  // Adding a new type would mean adding a new branch in fetch-gtfs.ts.
+  // Non-transitous source types:
+  //   - "remote"  → upstream URL to fetch (legacy / external adapter repo)
+  //   - "adapter" → invoke an adapter package's ingestBuild (single-
+  //     publisher architecture; the adapter's published zip replaces
+  //     the upstream URL entirely — upstream_url stays null).
   let source = base.source;
   if (c.source) {
-    if (c.source.type !== 'remote') {
-      return { skip: `unknown source.type "${c.source.type}" (expected "remote")` };
+    const t = c.source.type;
+    if (t === 'remote') {
+      if (!c.source.url) {
+        return { skip: 'source.type=remote but no source.url' };
+      }
+      source = {
+        type: 'remote',
+        publisher: c.source.publisher ?? `remote (${new URL(c.source.url).hostname})`,
+        upstream_url: c.source.url,
+      };
+    } else if (t === 'adapter') {
+      // upstream_url is irrelevant — adapter.ingestBuild produces the zip.
+      source = {
+        type: 'adapter',
+        publisher: c.source.publisher ?? 'adapter',
+        upstream_url: null,
+      };
+    } else {
+      return { skip: `unknown source.type "${t}" (expected "remote" or "adapter")` };
     }
-    if (!c.source.url) {
-      return { skip: 'source.type=remote but no source.url' };
-    }
-    source = {
-      type: 'remote',
-      publisher: c.source.publisher ?? `remote (${new URL(c.source.url).hostname})`,
-      upstream_url: c.source.url,
-    };
   }
 
   return {
