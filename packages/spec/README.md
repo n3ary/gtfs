@@ -66,7 +66,7 @@ pnpm test
 
 ## Why this library exists
 
-Per the [gtfs-rt-contract.md](https://github.com/n3ary/neary/blob/main/docs/specs/gtfs-rt-contract.md), per-feed quirks live in the producer only. This library is the shared canonical contract across the n3ary org (app, gtfs, standards, cluj-napoca-gtfs-adapter).
+Per the [gtfs-rt-contract.md](https://github.com/n3ary/neary/blob/main/docs/specs/gtfs-rt-contract.md), per-feed quirks live in the producer only. This library is the shared canonical contract across the n3ary org (app, gtfs, gtfs-adapters, standards).
 
 ## Source
 
