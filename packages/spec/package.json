@@ -44,13 +44,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/n3ary/gtfs-sql.git",
+    "url": "git+https://github.com/n3ary/gtfs-publisher.git",
     "directory": "packages/spec"
   },
   "bugs": {
-    "url": "https://github.com/n3ary/gtfs-sql/issues"
+    "url": "https://github.com/n3ary/gtfs-publisher/issues"
   },
-  "homepage": "https://github.com/n3ary/gtfs-sql#readme",
+  "homepage": "https://github.com/n3ary/gtfs-publisher#readme",
   "dependencies": {
     "csv-parse": "^7.0.1",
     "zod": "^4.4.0"

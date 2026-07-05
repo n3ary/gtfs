@@ -14,7 +14,7 @@ Public on GitHub Packages — anyone can `npm install @n3ary/gtfs-spec` after au
 
 ### Option A: workflow_dispatch (recommended for the first cut)
 
-1. Go to https://github.com/n3ary/gtfs-sql/actions/workflows/publish-spec.yml
+1. Go to https://github.com/n3ary/gtfs-publisher/actions/workflows/publish-spec.yml
 2. Click "Run workflow"
 3. Enter the version, e.g. `0.2.0` or `0.2.0-rc.1` (prerelease tags allowed)
 4. The workflow:

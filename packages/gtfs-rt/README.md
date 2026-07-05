@@ -1,4 +1,4 @@
-# @gtfs/rt — live RT adapter (Step 7 of n3ary/gtfs-sql#34)
+# @gtfs/rt — live RT adapter (Step 7 of n3ary/gtfs-publisher#34)
 
 Fastify-based GTFS-RT adapter. Polls each feed's `realtime.vehicle_positions`
 URL on a schedule, applies per-feed quirks, and serves a clean
@@ -65,7 +65,7 @@ Hetzner CX22. Not in this package yet.
 
 ## Cross-references
 
-- [n3ary/gtfs-sql#34](https://github.com/n3ary/gtfs-sql/issues/34) — the parent issue (this is Step 7)
+- [n3ary/gtfs-publisher#34](https://github.com/n3ary/gtfs-publisher/issues/34) — the parent issue (this is Step 7)
 - [n3ary/app#161](https://github.com/n3ary/app/issues/161) — the Cluj quirk rationale
 - [gtfs-rt-contract.md](https://github.com/n3ary/app/blob/main/docs/specs/gtfs-rt-contract.md) — the producer/consumer contract this adapter implements
 - [feed-agnostic.md](https://github.com/n3ary/app/blob/main/docs/standards/feed-agnostic.md) — the per-feed-quirks-belong-upstream rule

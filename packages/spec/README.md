@@ -70,7 +70,7 @@ Per the [gtfs-rt-contract.md](https://github.com/n3ary/neary/blob/main/docs/spec
 
 ## Source
 
-[https://github.com/n3ary/gtfs-sql/tree/main/packages/spec](https://github.com/n3ary/gtfs-sql/tree/main/packages/spec)
+[https://github.com/n3ary/gtfs-publisher/tree/main/packages/spec](https://github.com/n3ary/gtfs-publisher/tree/main/packages/spec)
 
 ## License
 

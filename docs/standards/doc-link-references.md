@@ -9,7 +9,7 @@ Two kinds of links in our docs and READMEs:
 |---|---|---|
 | External | full URL | `[pull request](https://github.com/...)` |
 | Same-repo | filename only, no path | `[agent-worktrees.md](agent-worktrees.md)` |
-| Cross-repo | repo + path, no leading slash | `[n3ary/gtfs-sql#34](https://github.com/n3ary/gtfs-sql/issues/34)` |
+| Cross-repo | repo + path, no leading slash | `[n3ary/gtfs-publisher#34](https://github.com/n3ary/gtfs-publisher/issues/34)` |
 
 ## The rule: filename only for same-repo links
 
