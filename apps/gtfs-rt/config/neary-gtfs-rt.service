@@ -1,0 +1,48 @@
+[Unit]
+Description=neary GTFS-RT adapter (Fastify, ghcr.io/n3ary/gtfs-rt)
+Documentation=https://github.com/n3ary/gtfs-publisher
+After=network-online.target
+Wants=network-online.target
+
+# Don't flap on transient ghcr.io outages: 10 restarts / 5 min, then back off.
+# The Fastify adapter already retries every POLL_INTERVAL_MS, so the unit
+# just needs to come back up cleanly.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+EnvironmentFile=/etc/neary-gtfs/rt.env
+
+ExecStartPre=-/usr/bin/podman rm -f neary-gtfs-rt
+
+# Rootful so podman can map host port 80 (privileged) into the container's 8080.
+ExecStart=/usr/bin/podman run \
+  --rm \
+  --name neary-gtfs-rt \
+  -p 80:8080 \
+  --env-file /etc/neary-gtfs/rt.env \
+  --log-driver journald \
+  --label io.github.n3ary.component=gtfs-rt \
+  --label org.opencontainers.image.source=https://github.com/n3ary/gtfs-publisher \
+  ghcr.io/n3ary/gtfs-rt:latest
+
+ExecStop=/usr/bin/podman stop --time 10 neary-gtfs-rt
+ExecStopPost=-/usr/bin/podman rm -f neary-gtfs-rt
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/neary-gtfs
+
+# CX23 is 2 vCPU / 4 GB. Cap memory + CPU so a runaway doesn't take the host down.
+MemoryMax=512M
+CPUQuota=150%
+
+[Install]
+WantedBy=multi-user.target
