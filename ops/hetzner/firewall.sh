@@ -14,21 +14,40 @@
 #   - first deploy (initial setup)
 #   - after a CF edge-IP change (CF posts to their changelog;
 #     re-run is idempotent)
-#   - when you want to rotate the SSH source IP
+#   - when you want to rotate the SSH source IP (see SSH_IP below)
 #
 # Pre-reqs:
 #   - hcloud CLI installed and authenticated (`hcloud context`)
 #   - jq (for the JSON parse)
 #
 # Usage:
-#   HCLOUD_SERVER_NAME=ubuntu-4gb-nbg1-1 bash ops/hetzner/firewall.sh
-# or:
-#   HCLOUD_SERVER_ID=147556356 bash ops/hetzner/firewall.sh
+#   bash ops/hetzner/firewall.sh                                  # uses SSH_IP from the env or its built-in default
+#   SSH_IP=1.2.3.4 bash ops/hetzner/firewall.sh                  # rotate the SSH source IP at the same time
+#   HCLOUD_SERVER_NAME=other-server bash ops/hetzner/firewall.sh # target a different Hetzner server
+#   HCLOUD_SERVER_ID=147556356 bash ops/hetzner/firewall.sh      # or by id
+#
+# SSH IP rotation (when your ISP gives you a new IP):
+#
+#   1. Detect the new IP from the workstation you'll SSH FROM:
+#        curl -sSf https://api.ipify.org
+#   2. Re-run with that IP, which replaces the SSH rule in place:
+#        SSH_IP=$(curl -sSf https://api.ipify.org) bash ops/hetzner/firewall.sh
+#   3. Verify:
+#        hcloud firewall describe neary-gtfs-rt-01-edge-only
+#      The first rule's source_ips should now be ["NEW_IP/32"].
+#
+# This works because the script idempotently calls
+# `hcloud firewall replace-rules` on every run, so a one-liner is
+# all the rotation procedure is. If you SSH from a second location
+# (a second home, a VPN exit), pass SSH_IP_2 as well and the rule's
+# source_ips becomes ["IP1/32", "IP2/32"].
 
 set -euo pipefail
 
 : "${HCLOUD_SERVER_NAME:=ubuntu-4gb-nbg1-1}"
 : "${HCLOUD_SERVER_ID:=}"
+: "${SSH_IP:=78.97.175.93}"        # default: Marius's current home IPv4 (set via env to rotate)
+: "${SSH_IP_2:=}"                  # optional: second source for SSH (e.g. a second home, VPN exit)
 
 command -v hcloud >/dev/null || { echo "hcloud CLI not installed" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq not installed (apt-get install jq)" >&2; exit 1; }
@@ -57,7 +76,7 @@ echo "target server: $HCLOUD_SERVER_NAME (id $HCLOUD_SERVER_ID)"
 
 # Build the rules JSON for hcloud firewall create/update.
 # 8 rules:
-#  - in tcp/22 from anywhere (SSH; tighten to your IP later)
+#  - in tcp/22 from SSH_IP (your current home IPv4; pass SSH_IP= to rotate)
 #  - in icmp from anywhere (ping)
 #  - in tcp/80 from CF edge (orange-cloud HTTP)
 #  - in tcp/443 from CF edge (orange-cloud HTTPS)
@@ -65,13 +84,22 @@ echo "target server: $HCLOUD_SERVER_NAME (id $HCLOUD_SERVER_ID)"
 #  - out tcp/80 (apt redirects)
 #  - out udp/53 (DNS)
 #  - out icmp
+
+# Compose the SSH source_ips array. Always includes $SSH_IP/32; if
+# SSH_IP_2 is set, also includes that. Both are explicit /32 hosts,
+# not subnets — only your two SSH source IPs can reach port 22.
+ssh_sources=$(jq -nc --arg ip "$SSH_IP" --arg ip2 "$SSH_IP_2" \
+  '$ip2 != "" | if . then [$ip, $ip2] else [$ip] end | map(. + "/32")')
+ssh_count=$(printf '%s' "$ssh_sources" | jq 'length')
+echo "SSH source IPs (port 22): $(printf '%s' "$ssh_sources" | jq -c .)"
+
 read -r -d '' RULES_JSON <<EOF
 {
   "rules": [
     {
       "direction": "in", "protocol": "tcp", "port": "22",
-      "source_ips": ["0.0.0.0/0", "::/0"],
-      "description": "SSH from anywhere (tighten to your IP later)"
+      "source_ips": $(printf '%s' "$ssh_sources" | jq -c .),
+      "description": "SSH from operator's home IP (rotate via SSH_IP=...)"
     },
     {
       "direction": "in", "protocol": "icmp",
@@ -127,5 +155,5 @@ else
   hcloud firewall apply-to-resource --type server --server "$HCLOUD_SERVER_NAME" "$FW_NAME" >/dev/null
 fi
 
-echo "ok: $FW_NAME applied to $HCLOUD_SERVER_NAME"
+echo "ok: $FW_NAME applied to $HCLOUD_SERVER_NAME (SSH restricted to $ssh_count IP(s))"
 echo "verify: hcloud firewall describe $FW_NAME"

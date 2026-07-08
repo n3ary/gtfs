@@ -48,8 +48,9 @@ edge range — the script re-fetches on every invocation, so
 re-running it is enough to refresh.
 
 Inbound:
-- tcp/22 from anywhere (SSH; tighten to your IP when you have a
-  static one — edit the `0.0.0.0/0, ::/0` in the script and rerun).
+- tcp/22 from `$SSH_IP/32` (the operator's current home IPv4 — see
+  rotation procedure below). A second source can be added with
+  `SSH_IP_2=...` (e.g. a second home, a VPN exit).
 - tcp/80 + tcp/443 from the live CF edge IP ranges (the
   orange-cloud proxy). Other source IPs are blocked at the network
   layer.
@@ -63,10 +64,40 @@ control, in addition to whatever you put on the VM with iptables.
 The CF edge always reaches the VM via 178.104.6.65:80 (or :443 if
 you set SSL=full_strict on the zone instead of `full`).
 
-Usage:
+### Usage
+
 ```bash
 # pre-reqs: hcloud CLI authenticated, jq installed
-bash ops/hetzner/firewall.sh                                    # uses default server name
+bash ops/hetzner/firewall.sh                                    # uses default server + SSH_IP=78.97.175.93
 HCLOUD_SERVER_ID=147556356 bash ops/hetzner/firewall.sh         # or by id
 hcloud firewall describe neary-gtfs-rt-01-edge-only             # verify
 ```
+
+### Rotating the SSH source IP (when your ISP gives you a new IP)
+
+The script idempotently calls `hcloud firewall replace-rules` on
+every run, so rotation is a one-liner from the workstation you'll
+SSH FROM:
+
+```bash
+# 1. find your current public IP
+curl -sSf https://api.ipify.org
+# -> e.g. 78.97.175.93
+
+# 2. re-run firewall.sh with the new IP as SSH_IP
+SSH_IP=$(curl -sSf https://api.ipify.org) bash ops/hetzner/firewall.sh
+
+# 3. verify the rule was replaced in place
+hcloud firewall describe neary-gtfs-rt-01-edge-only | grep -A3 'port: "22"'
+```
+
+The script's built-in default for `SSH_IP` is the operator's home
+IPv4 at the time of writing. Pass `SSH_IP=...` to override
+without editing the file. If you SSH from a second location, pass
+`SSH_IP_2=...` and the rule's source_ips becomes `[IP1/32, IP2/32]`.
+
+Why a one-shot env var instead of editing the script: editing the
+script on every rotation churns the repo history with one-line IP
+bumps and creates a public-PR trail of your home address. The env
+var keeps the repo at "current IP" without exposing your rotations
+in git log.
