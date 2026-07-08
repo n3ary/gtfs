@@ -35,7 +35,7 @@ ExecStop=/usr/bin/podman stop --time 10 neary-gtfs-rt
 ExecStopPost=-/usr/bin/podman rm -f neary-gtfs-rt
 
 NoNewPrivileges=yes
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes
 ReadOnlyPaths=/etc/neary-gtfs

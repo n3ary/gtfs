@@ -49,7 +49,12 @@ export async function fetchVehiclePositions(
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: ac.signal });
+    // Custom UA: Transitous (and several other upstream feeds) sit
+    // behind Cloudflare and reject the default `node/*` UA. The
+    // PWA's Pages Function already sets `neary-pages-proxy/1` for
+    // the same reason; the origin server uses the same convention
+    // so both paths present identically upstream.
+    const res = await fetch(url, { signal: ac.signal, headers: { "user-agent": "neary-pages-proxy/1" } });
     if (!res.ok) {
       throw new UpstreamFetchError(`upstream ${res.status} ${res.statusText}`, url);
     }
