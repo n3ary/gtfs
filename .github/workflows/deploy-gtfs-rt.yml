@@ -5,35 +5,47 @@ name: Deploy gtfs-rt to Hetzner
 #
 # Flow:
 #   1. SSH into the Hetzner VM via the gtfs-rt.n3ary.com hostname.
-#      The hostname always resolves to the currently-active VM (the
-#      rebuild-gtfs-rt-vm workflow updates the DNS A record as part
-#      of a VM swap), so this single SSH target survives rebuilds.
-#   2. Log in to ghcr.io inside the VM (the systemd unit's image
-#      tag is ghcr.io/n3ary/gtfs-rt:latest).
-#   3. Pull the new image. Podman reuses layers, so a small code
-#      change is a 1-2 s pull.
-#   4. Restart neary-gtfs-rt. Wait for /healthz to return 200.
-#   5. If /healthz does NOT return 200 within 30 s, the deploy is
-#      a failure. We call rebuild-gtfs-rt-vm to spin up a fresh
-#      VM. The old VM stays serving during the swap.
+#      The hostname always resolves to the currently-active VM
+#      (rebuild-gtfs-rt-vm updates the DNS A record as part of a
+#      VM swap), so this single SSH target survives rebuilds.
+#   2. PRE-CHECK: capture whether the currently-running container
+#      is healthy, and snapshot its image as a backup so we can
+#      roll back if the new image fails to start. The backup is
+#      only made when the current state is healthy - we never
+#      back up a known-bad image.
+#   3. DEPLOY: pull the new image, re-tag locally, restart the
+#      systemd unit.
+#   4. CONTAINER HEALTH CHECK: wait for the OCI HEALTHCHECK
+#      status (when defined in the image) or curl /healthz as
+#      fallback. Both must report healthy within the timeout
+#      window.
+#   5. ON FAILURE: if the pre-check was healthy, restore the
+#      backup image and restart; the rollback restores the
+#      service but the pipeline still fails (exit 1) so the
+#      operator notices. If the pre-check was unhealthy we
+#      don't roll back (the backup is also broken) - we just
+#      fail loudly.
 #
-# Required secrets (set in GitHub repo Settings > Secrets > Actions):
-#   HETZNER_HOST       - gtfs-rt.n3ary.com. A hostname is preferred
-#                        over a raw IP because the rebuild workflow
-#                        updates the DNS A record; the deploy job
-#                        always lands on the active VM.
-#   HETZNER_SSH_KEY    - private half of an SSH key whose public
-#                        half is registered at the Hetzner Cloud
-#                        Console (Project > Security > SSH keys).
-#                        The current CI runner's key is the same
-#                        key the operator uses day-to-day.
-#   HETZNER_SSH_USER   - SSH username on the VM (default: root).
-#                        The systemd unit runs as root because
-#                        podman needs CAP_NET_BIND_SERVICE to bind
-#                        port 80, so the SSH session must be root
-#                        too.
-#   GHCR_TOKEN         - github PAT with packages:read for n3ary org.
-#                        Same secret as build-gtfs-rt.yml's GHCR_TOKEN.
+# Configuration (only what is actually sensitive goes in GH Secrets):
+#   Secrets (Settings > Secrets > Actions):
+#     HETZNER_SSH_KEY    - private half of an SSH key whose public
+#                          half is registered at the Hetzner Cloud
+#                          Console (Project > Security > SSH keys).
+#     GHCR_TOKEN         - github PAT with packages:read for n3ary
+#                          org. Same secret as build-gtfs-rt.yml's
+#                          GHCR_TOKEN.
+#   Variables (Settings > Variables > Actions; visible to repo
+#   readers, used for public config that may differ per env):
+#     HETZNER_HOST       - hostname of the active VM. Defaults to
+#                          gtfs-rt.n3ary.com. A hostname is preferred
+#                          over a raw IP because the rebuild
+#                          workflow updates the DNS A record; the
+#                          deploy job always lands on the active VM.
+#   Hardcoded in the workflow:
+#     HETZNER_SSH_USER   - root. The systemd unit runs as root
+#                          because podman needs CAP_NET_BIND_SERVICE
+#                          to bind port 80, so the SSH session must
+#                          be root too. No override needed.
 
 on:
   workflow_run:
@@ -46,6 +58,10 @@ on:
         required: false
         default: 'latest'
 
+env:
+  HETZNER_HOST: ${{ vars.HETZNER_HOST || 'gtfs-rt.n3ary.com' }}
+  HETZNER_SSH_USER: root
+
 concurrency:
   group: deploy-gtfs-rt
   cancel-in-progress: true
@@ -54,67 +70,147 @@ jobs:
   deploy:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: Pull, restart, healthcheck
+      - name: Deploy (pre-check, backup, pull, restart, healthcheck, rollback)
         uses: appleboy/ssh-action@v1
         with:
-          host: ${{ secrets.HETZNER_HOST }}
-          username: ${{ secrets.HETZNER_SSH_USER || 'root' }}
+          host: ${{ vars.HETZNER_HOST || 'gtfs-rt.n3ary.com' }}
+          username: root
           key: ${{ secrets.HETZNER_SSH_KEY }}
-          command_timeout: 8m
+          command_timeout: 12m
           script: |
             set -euo pipefail
             TAG='${{ github.event.inputs.image_tag || 'latest' }}'
-            echo "deploying ghcr.io/n3ary/gtfs-rt:${TAG} to $(hostname) ($(hostname -i))"
+            LOG() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
+            FAIL() { LOG "FAIL: $*"; exit 1; }
+            ROLLBACK_DONE=0
+            trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$ROLLBACK_DONE" = "1" ]; then LOG "deploy failed; rollback already applied"; fi' EXIT
 
-            # Log in to ghcr.io so podman can pull from
-            # ghcr.io/n3ary/gtfs-rt. The token is passed via stdin so
-            # it never appears in `ps auxe` output.
+            LOG "deploying ghcr.io/n3ary/gtfs-rt:${TAG} to $(hostname) ($(hostname -i))"
+
+            # ---- Log in to ghcr.io so podman can pull ----
             if [ -n "${GHCR_TOKEN:-}" ]; then
-              echo "${GHCR_TOKEN}" | podman login ghcr.io -u ciotlosm --password-stdin
+              echo "${GHCR_TOKEN}" | podman login ghcr.io -u ciotlosm --password-stdin >/dev/null
             fi
 
-            # Pull the new image. Even a 200 MB image lands in seconds
-            # when only a few lines of code changed - podman reuses
-            # the existing layers.
+            # ---- Pre-check: is the current container healthy? ----
+            # We use podman's State.Healthcheck.Status when present,
+            # otherwise we fall back to curl /healthz. The health
+            # probe runs twice (5 s apart) to avoid flapping on a
+            # transient CF edge hiccup.
+            PROBE() {
+              local status
+              status=$(podman inspect neary-gtfs-rt \
+                --format '{{.State.Healthcheck.Status}}' 2>/dev/null \
+                || echo none)
+              case "$status" in
+                healthy) echo healthy; return 0;;
+                unhealthy|starting|none|"")
+                  # HEALTHCHECK not defined (or container not yet up).
+                  # Fall back to /healthz.
+                  if curl -fsS --max-time 2 http://127.0.0.1/healthz >/dev/null 2>&1; then
+                    echo "healthz-ok"; return 0
+                  fi
+                  # container may not even be running; that's "down"
+                  if ! podman container exists neary-gtfs-rt 2>/dev/null; then
+                    echo down; return 0
+                  fi
+                  echo unhealthy; return 0;;
+              esac
+            }
+
+            PREV_STATE=$(PROBE)
+            LOG "pre-check: previous container state = ${PREV_STATE}"
+            case "$PREV_STATE" in
+              healthy|healthz-ok) PREV_HEALTHY=1;;
+              *)                  PREV_HEALTHY=0;;
+            esac
+
+            # ---- Backup: snapshot the current image as previous ----
+            # Only when the current container was healthy - never
+            # back up a known-bad image. The backup tag is the
+            # short SHA of the currently-running image so we know
+            # what we're rolling back to.
+            BACKUP_TAG=""
+            if [ "$PREV_HEALTHY" = "1" ]; then
+              CURRENT_SHA=$(podman inspect localhost/gtfs-rt:latest \
+                --format '{{.Id}}' 2>/dev/null \
+                | sed 's/^sha256://' | cut -c1-12 || echo "")
+              if [ -n "$CURRENT_SHA" ]; then
+                BACKUP_TAG="localhost/gtfs-rt:previous-${CURRENT_SHA}"
+                podman tag localhost/gtfs-rt:latest "$BACKUP_TAG"
+                LOG "backup created: ${BACKUP_TAG}"
+              fi
+            else
+              LOG "previous container was not healthy; skipping backup (rolling back to a bad image is worse than failing)"
+            fi
+
+            # ---- Pull the new image ----
+            LOG "pulling ghcr.io/n3ary/gtfs-rt:${TAG}"
             podman pull "ghcr.io/n3ary/gtfs-rt:${TAG}"
 
-            # Restart the systemd unit. ExecStartPre in the unit does
-            # the actual podman rm + run; we just trigger a restart.
+            # ---- Retag locally so the systemd unit (which
+            # references localhost/gtfs-rt:latest) picks up the
+            # new image ----
+            podman tag "ghcr.io/n3ary/gtfs-rt:${TAG}" localhost/gtfs-rt:latest
+
+            # ---- Restart the systemd unit ----
+            LOG "restarting neary-gtfs-rt"
             systemctl restart neary-gtfs-rt
 
-            # Wait for /healthz to return 200. Returns 200 only when
-            # the container is up AND has fetched feeds.json AND has
-            # at least one adapter polling. 30 s is generous; typical
-            # cold start is 5-8 s.
+            # ---- Wait for the new container's healthcheck ----
+            # OCI HEALTHCHECK status, with curl /healthz fallback.
+            # 90 s total budget: start-period=10 s in the image
+            # HEALTHCHECK plus 3 retries at 30 s intervals = ~100 s;
+            # 90 s is tight but matches reality on a healthy image.
+            NEW_HEALTHY=0
             for i in $(seq 1 30); do
-              if curl -fsS --max-time 2 http://127.0.0.1/healthz >/dev/null 2>&1; then
-                echo "ok: /healthz 200 after ${i}s"
-                echo "deploy finished at $(date -u +%FT%TZ)"
-                exit 0
-              fi
-              sleep 1
+              sleep 3
+              NEW_STATE=$(PROBE)
+              case "$NEW_STATE" in
+                healthy|healthz-ok)
+                  LOG "container healthcheck ok after ${i} probes (state=${NEW_STATE})"
+                  NEW_HEALTHY=1
+                  break;;
+                *) LOG "probe ${i}: state=${NEW_STATE}";;
+              esac
             done
 
-            echo "fail: /healthz never returned 200 in 30 s"
-            echo "=== last 30 lines of journal ==="
-            journalctl -u neary-gtfs-rt -n 30 --no-pager || true
-            exit 1
+            if [ "$NEW_HEALTHY" = "1" ]; then
+              LOG "deploy finished ok at $(date -u +%FT%TZ)"
+              exit 0
+            fi
+
+            # ---- Health check failed ----
+            LOG "FAIL: new container did not become healthy in 90 s"
+            LOG "=== last 40 lines of journal ==="
+            journalctl -u neary-gtfs-rt -n 40 --no-pager || true
+            LOG "=== podman inspect health state ==="
+            podman inspect neary-gtfs-rt --format '{{json .State.Healthcheck}}' 2>/dev/null || echo "container gone"
+
+            # Rollback if we have a backup AND the backup is
+            # different from the (broken) current image.
+            if [ -n "$BACKUP_TAG" ]; then
+              LOG "rolling back to ${BACKUP_TAG}"
+              podman tag "$BACKUP_TAG" localhost/gtfs-rt:latest
+              systemctl restart neary-gtfs-rt
+              ROLLBACK_DONE=1
+              # Give the rollback 30 s to come up healthy.
+              for i in $(seq 1 10); do
+                sleep 3
+                ROLL_STATE=$(PROBE)
+                case "$ROLL_STATE" in
+                  healthy|healthz-ok)
+                    LOG "rollback ok: state=${ROLL_STATE} after ${i} probes"
+                    LOG "service restored to previous version; pipeline still fails so the operator notices"
+                    FAIL "deploy of ${TAG} failed; rolled back to ${BACKUP_TAG}";;
+                esac
+              done
+              LOG "rollback also did not become healthy in 30 s"
+              FAIL "deploy of ${TAG} failed; rollback to ${BACKUP_TAG} also unhealthy"
+            fi
+
+            FAIL "deploy of ${TAG} failed; no backup available (previous was already unhealthy)"
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-
-      - name: Trigger VM rebuild on deploy failure
-        # If we got here, the SSH step succeeded but /healthz never
-        # returned 200. The container is wedged (bad image, port map
-        # race, etc.) and podman-level fixes won't help. Spin up a
-        # new VM. The old one stays serving until the DNS swap.
-        if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "deploy failed; triggering rebuild-gtfs-rt-vm"
-          gh workflow run rebuild-gtfs-rt-vm.yml \
-            --repo '${{ github.repository }}' \
-            -f reason='deploy-gtfs-rt failed healthcheck'

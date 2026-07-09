@@ -1,0 +1,20 @@
+[Unit]
+Description=Run gtfs-rt health probe every hour
+
+[Timer]
+# Top of every hour. Adjust to every-N-hours with OnUnitActiveSec
+# if the operator wants a longer interval; the script is cheap
+# (one curl + maybe one restart) so hourly is fine.
+OnCalendar=hourly
+# If the VM was off during the scheduled slot, skip the missed
+# run. The container's Restart=on-failure already covers that
+# case during the downtime; firing a "stale" probe on boot
+# would just be noise.
+Persistent=false
+# Don't wake the VM up from sleep just for a health probe. If
+# the host is suspended we leave it alone; the probe just
+# doesn't run.
+WakeSystem=false
+
+[Install]
+WantedBy=timers.target

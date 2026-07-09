@@ -23,20 +23,27 @@ name: Rebuild gtfs-rt VM
 # A deploy-gtfs-rt run after this rebuild ensures the latest
 # image is on the new VM.
 #
-# Required secrets (set in GitHub repo Settings > Secrets > Actions):
-#   HCLOUD_TOKEN            - Hetzner Cloud API token with project
-#                             read+write scope.
-#   HETZNER_SSH_KEY         - private SSH key (same one as deploy job)
-#   HETZNER_SSH_PUBLIC_KEY  - PUBLIC half of the same key, used to
-#                             register the SSH key with the new VM.
-#                             Hetzner's `--ssh-key` flag takes a key
-#                             ID, so we look the key up by fingerprint.
-#   HETZNER_FIREWALL_NAME   - name of the Hetzner Cloud Firewall to
-#                             apply (default: neary-gtfs-rt-01-edge-only).
-#   CLOUDFLARE_API_TOKEN    - CF API token with Zone DNS edit for
-#                             n3ary.com. The DNS record id is
-#                             hardcoded because the deploy flow never
-#                             adds a second A record for gtfs-rt.
+# Configuration (only what is actually sensitive goes in GH Secrets):
+#   Secrets (Settings > Secrets > Actions):
+#     HCLOUD_TOKEN            - Hetzner Cloud API token with project
+#                               read+write scope.
+#     HETZNER_SSH_KEY         - private SSH key (same one as deploy job)
+#     CLOUDFLARE_API_TOKEN    - CF API token with Zone DNS edit for
+#                               n3ary.com. The DNS record id is a
+#                               variable below.
+#   Variables (Settings > Variables > Actions; visible to repo
+#   readers, used for public config that may differ per env):
+#     HETZNER_SSH_PUBLIC_KEY  - PUBLIC half of the same key, used to
+#                               compute the fingerprint that Hetzner's
+#                               `--ssh-key` flag accepts. The public
+#                               half is not sensitive - it's stored in
+#                               the Hetzner project as well.
+#     CLOUDFLARE_ZONE_ID      - n3ary.com zone id.
+#     CLOUDFLARE_GTFS_RT_A_RECORD_ID - gtfs-rt.n3ary.com A record id.
+#   Hardcoded in the workflow:
+#     HETZNER_SSH_USER        - root (matches deploy-gtfs-rt.yml).
+#     HETZNER_FIREWALL_NAME   - neary-gtfs-rt-01-edge-only (the
+#                               firewall id created by ops/hetzner/firewall.sh).
 
 on:
   workflow_dispatch:
@@ -128,11 +135,10 @@ jobs:
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
           NEW_NAME: ${{ steps.next-name.outputs.name }}
-          HETZNER_FIREWALL_NAME: ${{ secrets.HETZNER_FIREWALL_NAME }}
-          SSH_PUBLIC_KEY: ${{ secrets.HETZNER_SSH_PUBLIC_KEY }}
+          SSH_PUBLIC_KEY: ${{ vars.HETZNER_SSH_PUBLIC_KEY }}
         run: |
           set -euo pipefail
-          FIREWALL="${HETZNER_FIREWALL_NAME:-neary-gtfs-rt-01-edge-only}"
+          FIREWALL="neary-gtfs-rt-01-edge-only"
 
           # The SSH key has to already be registered at the project
           # level (Hetzner Cloud Console > Project > Security > SSH
@@ -184,16 +190,16 @@ jobs:
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ steps.create.outputs.ip }}
-          username: ${{ secrets.HETZNER_SSH_USER || 'root' }}
+          username: root
           key: ${{ secrets.HETZNER_SSH_KEY }}
-          source: 'apps/gtfs-rt/config/{install.sh,neary-gtfs-rt.service,rt.env.example}'
+          source: 'apps/gtfs-rt/config/{install.sh,neary-gtfs-rt.service,neary-gtfs-rt-healthcheck.sh,neary-gtfs-rt-healthcheck.service,neary-gtfs-rt-healthcheck.timer,rt.env.example}'
           target: /tmp/neary-install
 
       - name: Bootstrap new VM
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ steps.create.outputs.ip }}
-          username: ${{ secrets.HETZNER_SSH_USER || 'root' }}
+          username: root
           key: ${{ secrets.HETZNER_SSH_KEY }}
           command_timeout: 10m
           script: |

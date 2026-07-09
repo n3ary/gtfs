@@ -59,29 +59,80 @@ snapshot to clients. Once the new VM's `/healthz` is 200, the DNS
 record is updated; CF picks it up within seconds; clients see one
 round of "miss + stale fetch + live" instead of an outage.
 
-Three GitHub Actions workflows implement the resilience flow:
+Three GitHub Actions workflows plus one on-VM timer implement the
+resilience flow:
 
-| Workflow | Trigger | Action |
+| Component | Trigger | Action |
 |---|---|---|
 | `build-gtfs-rt.yml` | push to main (paths filtered to rt app), `gtfs-rt-v*` tag, manual | Build the container image and push to `ghcr.io/n3ary/gtfs-rt` with `:latest` + `:sha-<12hex>` tags. |
-| `deploy-gtfs-rt.yml` | workflow_run from build, manual | SSH to the active VM, `podman pull :latest`, restart the systemd unit, verify `/healthz`. On failure, triggers `rebuild-gtfs-rt-vm`. |
-| `healthcheck-gtfs-rt.yml` | cron `*/5 * * * *` | Probe `/healthz` twice (30 s apart). On two consecutive failures, triggers `rebuild-gtfs-rt-vm` and resets the counter. |
-| `rebuild-gtfs-rt-vm.yml` | workflow_dispatch, workflow_call | Create a new CX23, run `install.sh`, swap the CF DNS A record, delete the old VM. Triggers `deploy-gtfs-rt` afterwards to refresh `:latest`. |
+| `deploy-gtfs-rt.yml` | workflow_run from build, manual | SSH to the active VM, `podman pull :latest`, retag to `localhost/gtfs-rt:latest`, restart the systemd unit. Waits for the OCI HEALTHCHECK status (or `/healthz` curl fallback) to be `healthy`. On failure, restores the previous image and fails the pipeline. |
+| `rebuild-gtfs-rt-vm.yml` | workflow_dispatch, manual | Create a new CX23, run `install.sh`, swap the CF DNS A record, delete the old VM, then trigger `deploy-gtfs-rt` to refresh `:latest`. |
+| `neary-gtfs-rt-healthcheck.{service,timer}` | systemd timer, hourly on the VM itself | Probes `/healthz`; if non-200, restarts the systemd unit. Does NOT trigger a VM rebuild - this is a "wedged container self-heal", not a replacement. Zero GH Action minutes. |
+
+### Deploy health check + rollback (deploy-gtfs-rt.yml)
+
+The deploy job does NOT trust a single "200 OK" response from
+`/healthz`. It checks the OCI HEALTHCHECK status (when defined
+in the image) or `/healthz` as fallback, polled at 3 s intervals
+for up to 90 s. The exact sequence:
+
+1. **Pre-check**: probe the current container. If it's healthy,
+   snapshot its image as `localhost/gtfs-rt:previous-<short-sha>`
+   (a backup tag we can roll back to).
+2. **Deploy**: `podman pull`, retag to `localhost/gtfs-rt:latest`,
+   `systemctl restart neary-gtfs-rt`.
+3. **Health-check loop**: poll the OCI HEALTHCHECK status (or curl
+   `/healthz`) every 3 s for up to 90 s. If `healthy`, done.
+4. **On failure with a backup**: retag the backup to
+   `localhost/gtfs-rt:latest`, restart, wait 30 s for healthy.
+   The service is restored to the previous version, but the
+   pipeline still fails (`exit 1`) so the operator notices the
+   broken image and can roll the source back.
+5. **On failure with no backup** (previous was already unhealthy):
+   just fail loudly. We never restore a known-bad image.
+
+### On-VM hourly timer (neary-gtfs-rt-healthcheck.timer)
+
+Installed by `install.sh` via `systemctl enable --now`. Runs the
+`neary-gtfs-rt-healthcheck.sh` script every hour. The script
+probes `/healthz`; on failure, restarts the systemd unit. No
+external dependencies - this is the smallest possible hammer that
+clears a wedged container (transient OOM kill, podman lockup,
+etc.). It does NOT trigger a rebuild and does NOT call out to
+GitHub. Zero GH Action minutes consumed.
+
+A rebuild of the VM is only triggered when:
+- the deploy job itself fails (operator's manual `workflow_dispatch`
+  on `rebuild-gtfs-rt-vm.yml`), OR
+- the operator decides the on-VM timer hasn't recovered the
+  service and runs `gh workflow run rebuild-gtfs-rt-vm.yml
+  -f reason=...` from the workstation.
+
+This split exists because GH Actions minutes cost money (2000
+min/month free for private repos, then billed) and a per-minute
+rebuild workflow on a wedged VM would burn through that budget
+fast. The on-VM timer is free; rebuild is paid for only when
+escalation is actually warranted.
 
 Required repo secrets / variables:
 
 | Name | Type | Used by | Notes |
 |---|---|---|---|
-| `HCLOUD_TOKEN` | secret | rebuild-vm | Hetzner Cloud API token. |
-| `HETZNER_SSH_KEY` | secret | deploy, rebuild-vm | Private SSH key. |
-| `HETZNER_SSH_PUBLIC_KEY` | secret | rebuild-vm | Public half of the same key, for `hcloud server create --ssh-key <fp>`. |
-| `HETZNER_SSH_USER` | secret | deploy, rebuild-vm | SSH username. Default `root` (the systemd unit runs as root). |
-| `HETZNER_FIREWALL_NAME` | secret | rebuild-vm | Defaults to `neary-gtfs-rt-01-edge-only` if unset. |
-| `HETZNER_HOST` | secret | deploy | `gtfs-rt.n3ary.com`. A hostname so the deploy job lands on whichever VM is currently active (DNS swap from rebuild-vm). |
+| `HCLOUD_TOKEN` | secret | rebuild-vm | Hetzner Cloud API token with project read+write. |
+| `HETZNER_SSH_KEY` | secret | deploy, rebuild-vm | Private SSH key. Registered in Hetzner project (the public half is in `HETZNER_SSH_PUBLIC_KEY`). |
 | `GHCR_TOKEN` | secret | build, deploy | github PAT with `packages:read` (deploy) or `packages:write` (build) on the n3ary org. |
 | `CLOUDFLARE_API_TOKEN` | secret | rebuild-vm | CF API token with Zone DNS edit for n3ary.com. |
-| `CLOUDFLARE_ZONE_ID` | variable | rebuild-vm | n3ary.com zone id (currently `12fbec52c5a7ee6f7d14ba669a2862cb`). |
-| `CLOUDFLARE_GTFS_RT_A_RECORD_ID` | variable | rebuild-vm | `gtfs-rt.n3ary.com` A record id (currently `4aa2a22f67a93c1dac9394fa6bbf89af`). |
+| `HETZNER_SSH_PUBLIC_KEY` | variable | rebuild-vm | Public half of the same SSH key. Used to compute the fingerprint that `hcloud server create --ssh-key` accepts. Not sensitive - the public half is already stored in the Hetzner project. |
+| `HETZNER_HOST` | variable | deploy | Hostname the deploy job SSHes to. Defaults to `gtfs-rt.n3ary.com` if unset. A hostname is preferred over a raw IP because the rebuild workflow updates the DNS A record; the deploy job always lands on the active VM. |
+| `CLOUDFLARE_ZONE_ID` | variable | rebuild-vm | n3ary.com zone id (currently `12fbec52c5a7ee6f7d14ba669a2862cb`). Public value, just inconvenient to hardcode. |
+| `CLOUDFLARE_GTFS_RT_A_RECORD_ID` | variable | rebuild-vm | `gtfs-rt.n3ary.com` A record id (currently `4aa2a22f67a93c1dac9394fa6bbf89af`). Public value. |
+
+Hardcoded defaults (no GH config needed):
+
+| Name | Used by | Default |
+|---|---|---|
+| `HETZNER_SSH_USER` | deploy, rebuild-vm | `root`. The systemd unit runs as root because podman needs `CAP_NET_BIND_SERVICE` to bind port 80; the SSH session has to match. |
+| `HETZNER_FIREWALL_NAME` | rebuild-vm | `neary-gtfs-rt-01-edge-only`. The firewall id created by `ops/hetzner/firewall.sh`. |
 
 ### Manual recovery
 
