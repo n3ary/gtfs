@@ -70,6 +70,7 @@ jobs:
         # GHCR_TOKEN (the runner's default GITHUB_TOKEN is bound
         # to the runner's repo, not the n3ary org, so it cannot
         # land the image at ghcr.io/n3ary/).
+        id: build
         uses: redhat-actions/buildah-build@v2
         with:
           containerfiles: apps/gtfs-rt/Containerfile
@@ -103,11 +104,21 @@ jobs:
           tags: 'ghcr.io/n3ary/gtfs-rt:sha-${{ github.sha }}'
       - name: Push with GHCR_TOKEN
         # The buildah-build step above built the image into local
-        # containers-storage, tagged with the full 40-char SHA. We
-        # push from there to ghcr.io using GHCR_TOKEN, which is
-        # org-scoped (packages:write on n3ary) rather than the
-        # runner's default GITHUB_TOKEN (which is bound to the
-        # runner's repo, not the n3ary org).
+        # containers-storage, tagged with the full 40-char SHA.
+        # We push from there to ghcr.io using GHCR_TOKEN (which
+        # is org-scoped: packages:write on n3ary) rather than
+        # the runner's default GITHUB_TOKEN (which is bound to
+        # the runner's repo, not the n3ary org). Source is the
+        # action's `image-with-tag` output - whatever reference
+        # format the buildah-build action uses internally, it is
+        # guaranteed to round-trip through `buildah push`. We
+        # skip the `buildah tag` step entirely; `buildah push`
+        # accepts a `source` and a `destination` directly, and
+        # letting buildah-build own the source reference avoids
+        # the multi-segment "containers-storage:host/path:tag"
+        # format that `buildah tag` rejects as an invalid
+        # reference. Destination carries the 12-char slice and
+        # the :latest alias.
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: |
@@ -115,15 +126,9 @@ jobs:
           SHORT_SHA="${GITHUB_SHA::12}"
           for tag in "sha-${SHORT_SHA}" "latest"; do
             echo "pushing ghcr.io/n3ary/gtfs-rt:${tag}"
-            # Source uses the full SHA (matches what the buildah-
-            # build step above tagged). Destination uses the
-            # 12-char slice + :latest.
-            buildah tag \
-              "containers-storage:ghcr.io/n3ary/gtfs-rt:sha-${GITHUB_SHA}" \
-              "containers-storage:ghcr.io/n3ary/gtfs-rt:${tag}"
             buildah push \
               --creds "ciotlosm:${GHCR_TOKEN}" \
-              "containers-storage:ghcr.io/n3ary/gtfs-rt:${tag}" \
+              "${{ steps.build.outputs.image-with-tag }}" \
               "docker://ghcr.io/n3ary/gtfs-rt:${tag}"
           done
       - name: Summarise
