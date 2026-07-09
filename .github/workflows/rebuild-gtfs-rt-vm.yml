@@ -1,0 +1,274 @@
+name: Rebuild gtfs-rt VM
+
+# Spins up a fresh Hetzner CX23 in nbg1, runs the install script,
+# swaps the gtfs-rt.n3ary.com DNS A record to the new VM's primary
+# IPv4, then deletes the old VM.
+#
+# Flow:
+#   1. Find the currently-active VM by the role=gtfs-rt label.
+#   2. Provision a new VM with the next sequence number, the same
+#      firewall, and the same SSH keys.
+#   3. SSH to the new VM, run apps/gtfs-rt/config/install.sh, wait
+#      for /healthz to return 200 on the new VM.
+#   4. Update the Cloudflare DNS A record (gtfs-rt.n3ary.com) to
+#      the new VM's primary IPv4. CF propagation is <5 s.
+#   5. Delete the old VM. The DNS already points at the new one,
+#      so there is no user-visible downtime window - CF edge cache
+#      keeps the previous snapshot serving for ~5 s during the
+#      swap.
+#
+# This workflow does NOT redeploy the container - that's
+# deploy-gtfs-rt's job. The new VM is bootstrapped with whatever
+# image the install.sh / systemd unit pulls (latest at the time).
+# A deploy-gtfs-rt run after this rebuild ensures the latest
+# image is on the new VM.
+#
+# Configuration (only what is actually sensitive goes in GH Secrets):
+#   Secrets (Settings > Secrets > Actions):
+#     HCLOUD_TOKEN            - Hetzner Cloud API token with project
+#                               read+write scope.
+#     HETZNER_SSH_KEY         - private SSH key (same one as deploy job)
+#     CLOUDFLARE_API_TOKEN    - CF API token with Zone DNS edit for
+#                               n3ary.com. The DNS record id is a
+#                               variable below.
+#   Variables (Settings > Variables > Actions; visible to repo
+#   readers, used for public config that may differ per env):
+#     HETZNER_SSH_PUBLIC_KEY  - PUBLIC half of the same key, used to
+#                               compute the fingerprint that Hetzner's
+#                               `--ssh-key` flag accepts. The public
+#                               half is not sensitive - it's stored in
+#                               the Hetzner project as well.
+#     CLOUDFLARE_ZONE_ID      - n3ary.com zone id.
+#     CLOUDFLARE_GTFS_RT_A_RECORD_ID - gtfs-rt.n3ary.com A record id.
+#   Hardcoded in the workflow:
+#     HETZNER_SSH_USER        - root (matches deploy-gtfs-rt.yml).
+#     HETZNER_FIREWALL_NAME   - neary-gtfs-rt-01-edge-only (the
+#                               firewall id created by ops/hetzner/firewall.sh).
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why the rebuild is being triggered (informational only).'
+        required: false
+        default: ''
+  workflow_call:
+    inputs:
+      reason:
+        description: 'Why the rebuild is being triggered (informational only).'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: rebuild-gtfs-rt-vm
+  cancel-in-progress: false  # never cancel a half-finished rebuild
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install hcloud + jq
+        run: |
+          set -euo pipefail
+          # hcloud CLI is the documented Hetzner interface. curl-ing
+          # the REST API works too, but the CLI handles retries +
+          # error formatting for us.
+          curl -sSLo /tmp/hcloud.tar.gz \
+            https://github.com/hetznercloud/cli/releases/download/v1.49.0/hcloud-linux-amd64.tar.gz
+          tar -C /tmp -xzf /tmp/hcloud.tar.gz
+          mv /tmp/hcloud /usr/local/bin/hcloud
+          hcloud version
+
+      - name: Find the currently-active VM
+        id: find-active
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          set -euo pipefail
+          # role=gtfs-rt label is the source of truth for "which VM
+          # is currently serving gtfs-rt.n3ary.com". install.sh does
+          # not add this label (the GH Action does, via
+          # --label role=gtfs-rt at create time). For the FIRST VM,
+          # there is no label and we fall back to the highest-
+          # numbered gtfs-rt-nbg1-N by name.
+          ACTIVE_JSON=$(hcloud server list \
+            -l "role=gtfs-rt" \
+            -o json)
+          if [ "$(echo "$ACTIVE_JSON" | jq 'length')" = "0" ]; then
+            ACTIVE_NAME=$(hcloud server list \
+              -o json | jq -r '[.[] | select(.name | startswith("gtfs-rt-nbg1-"))] | max_by(.name) | .name')
+            if [ -z "$ACTIVE_NAME" ] || [ "$ACTIVE_NAME" = "null" ]; then
+              echo "no active VM found; treating this as a fresh provision"
+              echo "active_name=" >> "$GITHUB_OUTPUT"
+              echo "active_id=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            ACTIVE_NAME=$(echo "$ACTIVE_JSON" | jq -r '.[0].name')
+          fi
+          ACTIVE_ID=$(hcloud server describe "$ACTIVE_NAME" -o json | jq -r '.id')
+          ACTIVE_IP=$(hcloud server describe "$ACTIVE_NAME" -o json | jq -r '.public_net.ipv4.ip')
+          echo "active_name=${ACTIVE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "active_id=${ACTIVE_ID}" >> "$GITHUB_OUTPUT"
+          echo "active_ip=${ACTIVE_IP}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next VM name
+        id: next-name
+        env:
+          ACTIVE_NAME: ${{ steps.find-active.outputs.active_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ACTIVE_NAME" ]; then
+            NEXT="gtfs-rt-nbg1-1"
+          else
+            # Parse the trailing integer and bump it. Names are
+            # gtfs-rt-nbg1-N where N is monotonically increasing.
+            N="${ACTIVE_NAME##*-}"
+            NEXT="gtfs-rt-nbg1-$((N + 1))"
+          fi
+          echo "name=${NEXT}" >> "$GITHUB_OUTPUT"
+
+      - name: Provision the new VM
+        id: create
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          NEW_NAME: ${{ steps.next-name.outputs.name }}
+          SSH_PUBLIC_KEY: ${{ vars.HETZNER_SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          FIREWALL="neary-gtfs-rt-01-edge-only"
+
+          # The SSH key has to already be registered at the project
+          # level (Hetzner Cloud Console > Project > Security > SSH
+          # keys). We pass --ssh-key with the fingerprint of the
+          # public key; hcloud looks the key up by fingerprint and
+          # injects it into /root/.ssh/authorized_keys on first boot.
+          KEY_FP=$(ssh-keygen -lf <(printf '%s\n' "$SSH_PUBLIC_KEY") | awk '{print $2}')
+
+          echo "creating ${NEW_NAME} (firewall=${FIREWALL}, ssh-key fp=${KEY_FP})"
+          CREATE_OUT=$(hcloud server create \
+            --name "${NEW_NAME}" \
+            --type cx23 \
+            --location nbg1 \
+            --image ubuntu-26.04 \
+            --ssh-key "${KEY_FP}" \
+            --label "role=gtfs-rt" \
+            --label "created-by=rebuild-gtfs-rt-vm" \
+            --label "rebuild-reason=${{ inputs.reason || 'manual' }}" \
+            --start-after-create \
+            -o json)
+          NEW_ID=$(echo "$CREATE_OUT" | jq -r '.server.id')
+          NEW_IP=$(echo "$CREATE_OUT" | jq -r '.server.public_net.ipv4.ip')
+
+          # Apply the firewall (best-effort; if it fails we still
+          # have the VM, the operator can apply the firewall later).
+          hcloud firewall apply-to-resource \
+            --type server --server "${NEW_NAME}" \
+            "${FIREWALL}" || echo "warn: firewall apply failed; continuing"
+
+          echo "id=${NEW_ID}" >> "$GITHUB_OUTPUT"
+          echo "ip=${NEW_IP}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH on the new VM
+        env:
+          NEW_IP: ${{ steps.create.outputs.ip }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if nc -z -w 2 "$NEW_IP" 22 2>/dev/null; then
+              echo "ssh port 22 reachable on ${NEW_IP} after ${i} attempts"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "fail: SSH never came up on ${NEW_IP}"
+          exit 1
+
+      - name: Run install.sh on the new VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ steps.create.outputs.ip }}
+          username: root
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          source: 'apps/gtfs-rt/config/{install.sh,neary-gtfs-rt.service,neary-gtfs-rt-healthcheck.sh,neary-gtfs-rt-healthcheck.service,neary-gtfs-rt-healthcheck.timer,rt.env.example}'
+          target: /tmp/neary-install
+
+      - name: Bootstrap new VM
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.create.outputs.ip }}
+          username: root
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            mkdir -p /opt/neary-bootstrap
+            cp /tmp/neary-install/* /opt/neary-bootstrap/
+            cd /opt/neary-bootstrap
+            bash install.sh
+
+            # Wait for /healthz to come up on the new VM. The
+            # systemd unit pulls the image on first start, so allow
+            # up to 2 minutes.
+            for i in $(seq 1 60); do
+              if curl -fsS --max-time 2 http://127.0.0.1/healthz >/dev/null 2>&1; then
+                echo "ok: /healthz 200 on new VM after ${i} attempts"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "fail: /healthz never returned 200 on new VM"
+            journalctl -u neary-gtfs-rt -n 50 --no-pager || true
+            exit 1
+
+      - name: Swap the DNS A record
+        env:
+          NEW_IP: ${{ steps.create.outputs.ip }}
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
+          RECORD_ID: ${{ vars.CLOUDFLARE_GTFS_RT_A_RECORD_ID }}
+        run: |
+          set -euo pipefail
+          : "${ZONE_ID:?CLOUDFLARE_ZONE_ID repo variable is required}"
+          : "${RECORD_ID:?CLOUDFLARE_GTFS_RT_A_RECORD_ID repo variable is required}"
+
+          echo "updating gtfs-rt.n3ary.com A record -> ${NEW_IP}"
+          curl -sS -X PATCH \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID}" \
+            -H "Authorization: Bearer ${CF_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n \
+              --arg ip "${NEW_IP}" \
+              '{type:"A",name:"gtfs-rt.n3ary.com",content:$ip,proxied:true,ttl:1}')" \
+            | jq -e '.success == true' >/dev/null
+          echo "DNS swap complete"
+
+      - name: Wait for CF propagation
+        # CF API updates are usually instant; give it 15 s as a
+        # safety margin so the next steps don't race the cache.
+        run: sleep 15
+
+      - name: Delete the old VM
+        if: steps.find-active.outputs.active_id != ''
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          ACTIVE_ID: ${{ steps.find-active.outputs.active_id }}
+        run: |
+          set -euo pipefail
+          echo "deleting old VM ${ACTIVE_ID}"
+          hcloud server delete "${ACTIVE_ID}"
+          echo "old VM ${ACTIVE_ID} deleted"
+
+      - name: Trigger deploy job on the new VM
+        # Ensures the new VM has the latest image - the install.sh
+        # runs against whatever :latest was at provision time.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "triggering deploy-gtfs-rt to refresh the new VM's image"
+          gh workflow run deploy-gtfs-rt.yml \
+            --repo '${{ github.repository }}' \
+            -f image_tag=latest

@@ -1,0 +1,33 @@
+[Unit]
+Description=gtfs-rt health probe (hourly)
+
+# Probes the local container's /healthz. On failure, restarts the
+# systemd unit so a transient crash (bad podman cleanup, OOM kill
+# with no auto-restart, etc.) self-heals within an hour.
+#
+# Why hourly and not more frequent: the user's design is "minimal
+# automation on the VM, no rebuilds from healthcheck". A rebuild
+# only happens when the deploy job fails its OWN healthcheck,
+# which is triggered by a code push. The hourly timer is the
+# safety net for "container died for some other reason and
+# nobody noticed", not a high-frequency liveness probe.
+#
+# Why a restart (not an exec into the container, not a power
+# cycle): the container's RuntimeMax / Restart= are configured
+# by the systemd unit; if the unit itself is wedged (e.g. the
+# podman storage lock is stuck), a systemctl restart of the unit
+# tears down whatever podman started and starts it again. That's
+# the smallest hammer that reliably clears a wedged container.
+#
+# Persistent=false means the timer fires on the next OnCalendar
+# boundary if the machine was off at the scheduled time, rather
+# than queuing a missed run for whenever it next boots.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/neary-gtfs-rt-healthcheck.sh
+Nice=10
+IOSchedulingClass=best-effort
+
+[Install]
+WantedBy=multi-user.target
