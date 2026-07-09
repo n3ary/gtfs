@@ -14,28 +14,90 @@ The single bootstrap script (`install.sh`) lives in
 [`apps/gtfs-rt/config/install.sh`](../gtfs-rt/config/install.sh) —
 that's the one the operator runs on the host. It installs podman,
 copies the systemd unit + env file into place, and enables the
-service. The unit maps host port 80 → container 8080 via
+service. The unit maps host port 80 -> container 8080 via
 `podman run -p 80:8080`, so Cloudflare's default port 80 reaches
 the Fastify origin with no iptables.
 
 That's the entry point for "rebuild a Hetzner server from
-scratch" — `install.sh` is idempotent and meant to be the single
+scratch" - `install.sh` is idempotent and meant to be the single
 command you run on a fresh VM.
 
-## First-boot order
+## First-boot order (manual provision)
 
 1. `apt-get update && apt-get -y install git`
 2. `git clone https://github.com/n3ary/gtfs-publisher.git && cd gtfs-publisher`
 3. (Optional) `export IMAGE=ghcr.io/n3ary/gtfs-rt:sha-<hex>` to pin
-4. `bash apps/gtfs-rt/config/install.sh` — installs podman, copies the systemd unit + env, enables the service
-5. `curl -sSf http://127.0.0.1/healthz` — should return 200 JSON (host port 80 → container 8080)
+4. `bash apps/gtfs-rt/config/install.sh` - installs podman, copies the systemd unit + env, enables the service
+5. `curl -sSf http://127.0.0.1/healthz` - should return 200 JSON (host port 80 -> container 8080)
+
+For automated provisioning, the [rebuild-gtfs-rt-vm workflow](../.github/workflows/rebuild-gtfs-rt-vm.yml)
+does steps 1-5 for you (creates the VM via `hcloud`, copies the
+config, runs `install.sh`, verifies `/healthz`) and additionally
+swaps the DNS A record over to the new VM.
 
 ## Smoke test from the public internet
 
 ```bash
 curl -sI https://gtfs-rt.n3ary.com/rt/cluj-napoca/vehicle_positions
 # expect: HTTP/2 200, content-type: application/x-protobuf,
-# cache-control: public, max-age=5, cf-cache-status: MISS (first call) → HIT (within 5s)
+# cache-control: public, max-age=5, cf-cache-status: MISS (first call) -> HIT (within 5s)
+```
+
+## Resilience model (no floating IP)
+
+The Hetzner Cloud Floating IP was previously used as a "swap target"
+- rebuild a new VM, attach the FIP, the public IP never changes. We
+dropped the FIP for cost + simplicity: the public hostname
+(`gtfs-rt.n3ary.com`) resolves to the VM's primary IPv4 directly,
+and a VM swap is a CF DNS A-record update instead of a hypervisor-
+level FIP reassign.
+
+The CF cache rule (5 s TTL, see n3ary/app#74) absorbs the swap:
+during the ~5 s window where the new VM is being bootstrapped and
+the DNS record is being PATCHed, CF keeps serving the previous
+snapshot to clients. Once the new VM's `/healthz` is 200, the DNS
+record is updated; CF picks it up within seconds; clients see one
+round of "miss + stale fetch + live" instead of an outage.
+
+Three GitHub Actions workflows implement the resilience flow:
+
+| Workflow | Trigger | Action |
+|---|---|---|
+| `build-gtfs-rt.yml` | push to main (paths filtered to rt app), `gtfs-rt-v*` tag, manual | Build the container image and push to `ghcr.io/n3ary/gtfs-rt` with `:latest` + `:sha-<12hex>` tags. |
+| `deploy-gtfs-rt.yml` | workflow_run from build, manual | SSH to the active VM, `podman pull :latest`, restart the systemd unit, verify `/healthz`. On failure, triggers `rebuild-gtfs-rt-vm`. |
+| `healthcheck-gtfs-rt.yml` | cron `*/5 * * * *` | Probe `/healthz` twice (30 s apart). On two consecutive failures, triggers `rebuild-gtfs-rt-vm` and resets the counter. |
+| `rebuild-gtfs-rt-vm.yml` | workflow_dispatch, workflow_call | Create a new CX23, run `install.sh`, swap the CF DNS A record, delete the old VM. Triggers `deploy-gtfs-rt` afterwards to refresh `:latest`. |
+
+Required repo secrets / variables:
+
+| Name | Type | Used by | Notes |
+|---|---|---|---|
+| `HCLOUD_TOKEN` | secret | rebuild-vm | Hetzner Cloud API token. |
+| `HETZNER_SSH_KEY` | secret | deploy, rebuild-vm | Private SSH key. |
+| `HETZNER_SSH_PUBLIC_KEY` | secret | rebuild-vm | Public half of the same key, for `hcloud server create --ssh-key <fp>`. |
+| `HETZNER_SSH_USER` | secret | deploy, rebuild-vm | SSH username. Default `root` (the systemd unit runs as root). |
+| `HETZNER_FIREWALL_NAME` | secret | rebuild-vm | Defaults to `neary-gtfs-rt-01-edge-only` if unset. |
+| `HETZNER_HOST` | secret | deploy | `gtfs-rt.n3ary.com`. A hostname so the deploy job lands on whichever VM is currently active (DNS swap from rebuild-vm). |
+| `GHCR_TOKEN` | secret | build, deploy | github PAT with `packages:read` (deploy) or `packages:write` (build) on the n3ary org. |
+| `CLOUDFLARE_API_TOKEN` | secret | rebuild-vm | CF API token with Zone DNS edit for n3ary.com. |
+| `CLOUDFLARE_ZONE_ID` | variable | rebuild-vm | n3ary.com zone id (currently `12fbec52c5a7ee6f7d14ba669a2862cb`). |
+| `CLOUDFLARE_GTFS_RT_A_RECORD_ID` | variable | rebuild-vm | `gtfs-rt.n3ary.com` A record id (currently `4aa2a22f67a93c1dac9394fa6bbf89af`). |
+
+### Manual recovery
+
+If the cron healthcheck is broken or you want to force a rebuild
+without waiting for the second failure, trigger the workflow
+directly:
+
+```bash
+gh workflow run rebuild-gtfs-rt-vm.yml -f reason='manual ssh failure'
+```
+
+For a fresh deploy without a code change (e.g. to pick up a new
+ad-hoc image tag), trigger `deploy-gtfs-rt` with a specific tag:
+
+```bash
+gh workflow run deploy-gtfs-rt.yml -f image_tag=sha-abc123def456
 ```
 
 ## Hetzner Cloud Firewall
@@ -45,11 +107,11 @@ the current Cloudflare edge IP ranges (IPv4 + IPv6) from
 `https://api.cloudflare.com/client/v4/ips` at run time and applies
 the resulting rules via `hcloud firewall create` / `replace-rules`.
 A static rules file would go stale silently when CF adds a new
-edge range — the script re-fetches on every invocation, so
+edge range - the script re-fetches on every invocation, so
 re-running it is enough to refresh.
 
 Inbound:
-- tcp/22 from `$SSH_IP/32` (the operator's current home IPv4 — see
+- tcp/22 from `$SSH_IP/32` (the operator's current home IPv4 - see
   rotation procedure below). A second source can be added with
   `SSH_IP_2=...` (e.g. a second home, a VPN exit).
 - tcp/80 + tcp/443 from the live CF edge IP ranges (the
@@ -60,10 +122,11 @@ Inbound:
 Outbound: 80/443/53/icmp to anywhere (ghcr.io pull, apt, DNS).
 Everything else is blocked.
 
-The firewall sits at the Hetzner edge — it's a *network-layer*
-control. The CF edge always reaches the VM via 178.104.6.65:80
-(or :443 if you set SSL=full_strict on the zone instead of `full`).
-Podman's `-p 80:8080` then forwards that into the container.
+The firewall sits at the Hetzner edge - it's a *network-layer*
+control. The CF edge always reaches the VM via the VM's primary
+IPv4 on port 80 (or :443 if you set SSL=full_strict on the zone
+instead of `full`). Podman's `-p 80:8080` then forwards that into
+the container.
 
 ### Usage
 

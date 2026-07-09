@@ -1,0 +1,120 @@
+name: Deploy gtfs-rt to Hetzner
+
+# Triggers after the build workflow finishes successfully, OR
+# manually via workflow_dispatch for ad-hoc deploys / rollbacks.
+#
+# Flow:
+#   1. SSH into the Hetzner VM via the gtfs-rt.n3ary.com hostname.
+#      The hostname always resolves to the currently-active VM (the
+#      rebuild-gtfs-rt-vm workflow updates the DNS A record as part
+#      of a VM swap), so this single SSH target survives rebuilds.
+#   2. Log in to ghcr.io inside the VM (the systemd unit's image
+#      tag is ghcr.io/n3ary/gtfs-rt:latest).
+#   3. Pull the new image. Podman reuses layers, so a small code
+#      change is a 1-2 s pull.
+#   4. Restart neary-gtfs-rt. Wait for /healthz to return 200.
+#   5. If /healthz does NOT return 200 within 30 s, the deploy is
+#      a failure. We call rebuild-gtfs-rt-vm to spin up a fresh
+#      VM. The old VM stays serving during the swap.
+#
+# Required secrets (set in GitHub repo Settings > Secrets > Actions):
+#   HETZNER_HOST       - gtfs-rt.n3ary.com. A hostname is preferred
+#                        over a raw IP because the rebuild workflow
+#                        updates the DNS A record; the deploy job
+#                        always lands on the active VM.
+#   HETZNER_SSH_KEY    - private half of an SSH key whose public
+#                        half is registered at the Hetzner Cloud
+#                        Console (Project > Security > SSH keys).
+#                        The current CI runner's key is the same
+#                        key the operator uses day-to-day.
+#   HETZNER_SSH_USER   - SSH username on the VM (default: root).
+#                        The systemd unit runs as root because
+#                        podman needs CAP_NET_BIND_SERVICE to bind
+#                        port 80, so the SSH session must be root
+#                        too.
+#   GHCR_TOKEN         - github PAT with packages:read for n3ary org.
+#                        Same secret as build-gtfs-rt.yml's GHCR_TOKEN.
+
+on:
+  workflow_run:
+    workflows: ["Build ghcr.io/n3ary/gtfs-rt"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (default: latest). Useful for rolling back to a specific build.'
+        required: false
+        default: 'latest'
+
+concurrency:
+  group: deploy-gtfs-rt
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Pull, restart, healthcheck
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_SSH_USER || 'root' }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          command_timeout: 8m
+          script: |
+            set -euo pipefail
+            TAG='${{ github.event.inputs.image_tag || 'latest' }}'
+            echo "deploying ghcr.io/n3ary/gtfs-rt:${TAG} to $(hostname) ($(hostname -i))"
+
+            # Log in to ghcr.io so podman can pull from
+            # ghcr.io/n3ary/gtfs-rt. The token is passed via stdin so
+            # it never appears in `ps auxe` output.
+            if [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "${GHCR_TOKEN}" | podman login ghcr.io -u ciotlosm --password-stdin
+            fi
+
+            # Pull the new image. Even a 200 MB image lands in seconds
+            # when only a few lines of code changed - podman reuses
+            # the existing layers.
+            podman pull "ghcr.io/n3ary/gtfs-rt:${TAG}"
+
+            # Restart the systemd unit. ExecStartPre in the unit does
+            # the actual podman rm + run; we just trigger a restart.
+            systemctl restart neary-gtfs-rt
+
+            # Wait for /healthz to return 200. Returns 200 only when
+            # the container is up AND has fetched feeds.json AND has
+            # at least one adapter polling. 30 s is generous; typical
+            # cold start is 5-8 s.
+            for i in $(seq 1 30); do
+              if curl -fsS --max-time 2 http://127.0.0.1/healthz >/dev/null 2>&1; then
+                echo "ok: /healthz 200 after ${i}s"
+                echo "deploy finished at $(date -u +%FT%TZ)"
+                exit 0
+              fi
+              sleep 1
+            done
+
+            echo "fail: /healthz never returned 200 in 30 s"
+            echo "=== last 30 lines of journal ==="
+            journalctl -u neary-gtfs-rt -n 30 --no-pager || true
+            exit 1
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Trigger VM rebuild on deploy failure
+        # If we got here, the SSH step succeeded but /healthz never
+        # returned 200. The container is wedged (bad image, port map
+        # race, etc.) and podman-level fixes won't help. Spin up a
+        # new VM. The old one stays serving until the DNS swap.
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "deploy failed; triggering rebuild-gtfs-rt-vm"
+          gh workflow run rebuild-gtfs-rt-vm.yml \
+            --repo '${{ github.repository }}' \
+            -f reason='deploy-gtfs-rt failed healthcheck'

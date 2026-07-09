@@ -1,0 +1,81 @@
+# syntax=docker/dockerfile:1.7
+#
+# Multi-stage build for @gtfs/rt. Builder installs the full workspace
+# (with @n3ary/* deps from GH Packages, via the id=npm_token secret)
+# and uses `pnpm deploy --legacy` to produce a self-contained
+# dist/ + flat node_modules/. Runtime stage is just node:24-alpine
+# with the deployed tree, running as the unprivileged `node` user.
+#
+# Why the size is ~230 MB: Node 24 alpine (~60 MB) + Fastify +
+# protobufjs + pino + the @n3ary/* workspace deps (~100 MB).
+# The issue's 50 MB target needs a static-binary Node build, which
+# is a much bigger detour for marginal savings at this scale.
+
+# ---------- Stage 1: build ----------
+FROM node:24-alpine AS builder
+
+WORKDIR /src
+
+# pnpm version pinned in package.json#packageManager — corepack
+# resolves to the same version CI uses.
+RUN corepack enable
+
+# Build-secret for the @n3ary/* deps on GH Packages. The .npmrc is
+# scoped to this RUN via --mount=type=secret so the token never
+# lands in a layer. The file contents MUST be the token only —
+# `printf "%s" "$NPM_TOKEN" > /tmp/npm_token` — not a full
+# `_authToken=...` line; otherwise the printf concatenates the line
+# to itself and pnpm 401s.
+RUN --mount=type=secret,id=npm_token \
+    test -f /run/secrets/npm_token && \
+    printf '@n3ary:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=%s\n' \
+      "$(cat /run/secrets/npm_token)" > /root/.npmrc
+
+# Workspace metadata + sources. tsconfig.base.json is also copied
+# (the package tsconfigs extend it).
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json .npmrc ./
+COPY libs/ ./libs/
+COPY apps/gtfs-rt/ ./apps/gtfs-rt/
+COPY apps/gtfs-static/ ./apps/gtfs-static/
+
+# --frozen-lockfile: keep install deterministic. --trust-lockfile:
+# match the workspace's trustPolicy for pnpm 11.5 inside a fresh
+# container (the lockfile is source-tree, reviewed in PR, hashes
+# trusted without re-verifying against the live registry).
+RUN pnpm install --frozen-lockfile --trust-lockfile \
+  --filter @n3ary/gtfs-spec... --filter @gtfs/rt...
+RUN pnpm --filter @n3ary/gtfs-spec build
+RUN pnpm --filter @gtfs/rt build
+
+# --legacy: required on pnpm 10+ unless the workspace has
+# inject-workspace-packages=true set.
+RUN pnpm --filter @gtfs/rt --prod deploy --legacy /deploy
+
+# ---------- Stage 2: runtime ----------
+FROM node:24-alpine AS runtime
+
+LABEL org.opencontainers.image.title="gtfs-rt" \
+      org.opencontainers.image.description="Live GTFS-RT adapter (Fastify) — n3ary/gtfs-publisher" \
+      org.opencontainers.image.source="https://github.com/n3ary/gtfs-publisher" \
+      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
+
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=8080 \
+    LOG_LEVEL=info
+
+WORKDIR /app
+COPY --from=builder /deploy /app
+
+# The image's built-in `node` user owns the listening socket.
+USER node
+
+EXPOSE 8080
+
+# OCI image format strips HEALTHCHECK (warning at build time) but
+# Docker format keeps it. The systemd unit's podman exec healthcheck
+# is the reliable one in production regardless.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+
+CMD ["node", "dist/index.js"]
