@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   shared:
-    uses: n3ary/actions/.github/workflows/pr-validation.yml@v6
+    uses: n3ary/actions/.github/workflows/pr-validation.yml@v22
 
   validate:
     runs-on: ubuntu-latest
