@@ -20,10 +20,6 @@ on:
 # (`pr-check.yml`) handles ascii + standards-drift. Repo-specific
 # jobs (build, pipeline smoke) stay local because they need repo
 # secrets (NPM_TOKEN, TRANZY_API_KEY) and the full pipeline runner.
-#
-# SHA-pinned to the PR #36 merge commit until n3ary/actions cuts a
-# tagged release that includes the wrapper. Switch to @v23 (or
-# whichever tag covers the wrapper) when available.
 
 permissions:
   contents: read
@@ -31,7 +27,7 @@ permissions:
 
 jobs:
   pr-check:
-    uses: n3ary/actions/.github/workflows/pr-check.yml@55e3606351c523d4716d28819577816ddb818a0f
+    uses: n3ary/actions/.github/workflows/pr-check.yml@v23
 
   validate:
     runs-on: ubuntu-latest
