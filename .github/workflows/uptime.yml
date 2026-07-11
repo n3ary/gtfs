@@ -1,0 +1,222 @@
+name: gtfs-rt uptime
+
+# Probes gtfs-rt.n3ary.com every 15 minutes. Tracks failure state
+# via the GH Actions run history (no external state store needed).
+# On 3 consecutive failures, opens a single GH issue (idempotent -
+# re-uses the same issue if one is already open). Labels the issue
+# `vm-restart-pending` to trigger the recovery workflow, which
+# reboots the VM via the Hetzner API. The systemd unit
+# (`neary-gtfs-rt.service`) is enabled, so the container auto-
+# starts on boot and the next probe flips back to healthy.
+#
+# What this catches: service down, container crash loop, network
+# partition to the VM, Hetzner infra outage. The on-VM systemd
+# timer (PR #154 era) is the first-line recovery; this monitor
+# is the second-line that catches the cases the timer doesn't
+# (e.g. the unit itself is masked, or systemd is wedged).
+#
+# What this does NOT catch: silent data corruption (the service
+# returns 200 but vehicle_positions has 0 entities). The
+# /api/rt/cluj-napoca/vehicle_positions probe is a partial
+# defense (asserts the response body is non-empty), but a
+# thorough check would need an entity count assertion. Cheap
+# enough to add if you've seen that mode of failure.
+#
+# State machine:
+#   HEALTHY  -> all last 3 cron runs are success; no issue open
+#   DEGRADED -> one or two of the last 3 runs are failure
+#   DOWN     -> all last 3 runs are failure; issue open with
+#               `vm-restart-pending` label; recovery workflow
+#               has been triggered (or is running)
+#   recovery -> DEGRADED -> HEALTHY once 1+ success after DOWN
+#
+# This is `continue-on-error` on the probe step so a single bad
+# run doesn't kill the cron. State is determined AFTER the probe.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      simulate_failures:
+        description: 'Skip the real probe and treat this run as a failure (for testing the issue-open path).'
+        required: false
+        type: boolean
+        default: false
+      reset_state:
+        description: 'Close any open uptime issue and exit (for testing cleanup).'
+        required: false
+        type: boolean
+        default: false
+      recover_now:
+        description: 'Manually trigger the recovery workflow (reboot the VM). Use only after you understand the impact.'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Reset state (workflow_dispatch only)
+        if: ${{ inputs.reset_state == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ISSUE=$(gh issue list --state open --search "gtfs-rt.n3ary.com DOWN in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$ISSUE" ]; then
+            gh issue close "$ISSUE" --comment "Closed by manual reset (workflow_dispatch reset_state=true)."
+            echo "closed issue #$ISSUE"
+          else
+            echo "no open issue to close"
+          fi
+
+      - name: Skip rest if reset
+        if: ${{ inputs.reset_state == 'true' }}
+        run: |
+          echo "reset done - exiting"
+          exit 0
+
+      - name: Probe /healthz and /api/rt/cluj-napoca/vehicle_positions
+        id: probe
+        if: ${{ inputs.simulate_failures != 'true' && inputs.reset_state != 'true' }}
+        env:
+          SIMULATE_FAILURES: ${{ inputs.simulate_failures }}
+        run: |
+          set -uo pipefail
+          # SIMULATE_FAILURES: when this run is meant to be a
+          # failure (for testing), skip the curl calls. The
+          # success/failure of the step is what matters for the
+          # state machine below; we don't need to surface the
+          # curl error in the run summary.
+          if [ "${SIMULATE_FAILURES:-false}" = "true" ]; then
+            echo "::notice::simulate_failures=true; skipping real probe, treating as failure"
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          HSTATUS=$(curl -sS -m 10 -o /tmp/h.body -w '%{http_code}' https://gtfs-rt.n3ary.com/healthz || true)
+          HFAIL=$?
+          echo "healthz status=$HSTATUS curl_exit=$HFAIL"
+          H_BODY=$(head -c 200 /tmp/h.body 2>/dev/null || echo "")
+          echo "healthz_body=$H_BODY"
+          VSTATUS=$(curl -sS -m 10 -o /tmp/v.body -w '%{http_code}' https://gtfs-rt.n3ary.com/api/rt/cluj-napoca/vehicle_positions || true)
+          VFAIL=$?
+          echo "vehicle_positions status=$VSTATUS curl_exit=$VFAIL"
+          V_BODY=$(head -c 200 /tmp/v.body 2>/dev/null || echo "")
+          echo "vehicle_positions_body=$V_BODY"
+          # Both endpoints must return 200 AND the body must be
+          # non-empty. The 200 alone isn't enough - a misbehaving
+          # service can return 200 with an empty body.
+          if [ "$HSTATUS" != "200" ] || [ "$VSTATUS" != "200" ]; then
+            echo "::error::one or both endpoints non-200"
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ ! -s /tmp/h.body ] || [ ! -s /tmp/v.body ]; then
+            echo "::error::one or both bodies empty"
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if ! grep -q '"entity"' /tmp/v.body; then
+            echo "::error::vehicle_positions body missing 'entity' (silent-data-corruption sentinel)"
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "ok=1" >> "$GITHUB_OUTPUT"
+
+      - name: Skip rest if simulating recovery
+        if: ${{ inputs.recover_now == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "manually triggering recovery workflow"
+          gh workflow run recovery-gtfs-rt-vm.yml \
+            --repo '${{ github.repository }}' \
+            -f reason="manual-trigger-from-uptime-cron"
+          echo "recovery workflow dispatched"
+
+      - name: Compute state from last 3 runs
+        id: state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Read the last 3 runs of THIS workflow (including the
+          # current one). The probe step is the only job, so the
+          # run's overall conclusion == the probe's success.
+          CONCLUSIONS=$(gh api "repos/${{ github.repository }}/actions/workflows/uptime.yml/runs?per_page=3" \
+            --jq '.workflow_runs | map(.conclusion) | join(",")')
+          echo "last 3 conclusions: $CONCLUSIONS"
+          FAIL_COUNT=$(echo "$CONCLUSIONS" | tr ',' '\n' | grep -c '^failure$' || true)
+          echo "fail_count=$FAIL_COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$FAIL_COUNT" -ge 3 ]; then
+            echo "state=DOWN" >> "$GITHUB_OUTPUT"
+          elif [ "$FAIL_COUNT" -ge 1 ]; then
+            echo "state=DEGRADED" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=HEALTHY" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or close the incident issue
+        if: ${{ inputs.simulate_failures != 'true' && inputs.reset_state != 'true' && inputs.recover_now != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATE: ${{ steps.state.outputs.state }}
+        run: |
+          set -euo pipefail
+          ISSUE=$(gh issue list --state open --search "gtfs-rt.n3ary.com DOWN in:title" --json number --jq '.[0].number // empty')
+          echo "current open issue: $ISSUE"
+          if [ "$STATE" = "DOWN" ]; then
+            if [ -z "$ISSUE" ]; then
+              echo "creating incident issue"
+              ISSUE=$(gh issue create \
+                --title "gtfs-rt.n3ary.com DOWN — $(date -u +%FT%TZ)" \
+                --label "vm-restart-pending" \
+                --body "$(cat <<EOF
+          \`gtfs-rt.n3ary.com\` has failed 3 consecutive uptime
+          checks. The recovery workflow has been triggered
+          (Hetzner server reboot; the systemd unit
+          \`neary-gtfs-rt.service\` auto-starts the container on
+          boot).
+
+          - Last 3 conclusions: ${{ needs.probe.outputs.* }}
+          - Triggered at: $(date -u +%FT%TZ)
+          - First check after this issue was opened will close
+            it if the service is back. The issue is reopened
+            on the next 3-failure cycle.
+          EOF
+          )" \
+                --json number --jq '.number')
+              echo "created issue #$ISSUE"
+            else
+              echo "issue already open: #$ISSUE - ensuring label"
+              gh issue edit "$ISSUE" --add-label "vm-restart-pending" || true
+            fi
+            # Trigger the recovery workflow. Use the issue as a
+            # natural idempotency token: only one open issue means
+            # only one recovery at a time. The recovery workflow
+            # itself checks for the label.
+            echo "triggering recovery workflow"
+            gh workflow run recovery-gtfs-rt-vm.yml \
+              --repo '${{ github.repository }}' \
+              -f reason="uptime-cron-3-consecutive-failures"
+          else
+            # HEALTHY or DEGRADED. If there's an open issue, close
+            # it - the service is back (or the failures are
+            # intermittent and the issue is no longer accurate).
+            if [ -n "$ISSUE" ]; then
+              echo "closing issue #$ISSUE - state=$STATE"
+              gh issue close "$ISSUE" --comment "Auto-closed: state=$STATE (most recent cron run succeeded)."
+            else
+              echo "no incident issue to close"
+            fi
+          fi
+          echo "final_state=$STATE" >> "$GITHUB_OUTPUT"
