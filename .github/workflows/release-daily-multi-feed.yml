@@ -31,13 +31,20 @@ permissions:
 
 jobs:
   build:
-    # Skip build when the release bot (n3ary-release-bot) is the actor.
-    # The bot's release/calver-* PRs land on main as a squash merge; the
-    # `push` event fires with `github.actor = n3ary-release-bot[bot]`.
-    # The bot bumps `libs/spec/package.json`; running a full daily
-    # pipeline for a version-only commit is wasteful (the schedule +
-    # next upstream ETag change will catch up).
-    if: github.actor != 'n3ary-release-bot[bot]'
+    # No `if:` skip. The previous `github.actor != 'n3ary-release-bot[bot]'`
+    # guard was wrong for adapter-driven feeds: cluj-napoca (the only
+    # current adapter-driven feed) has no upstream_url, so the
+    # pipeline's ETag skip never matches and the pipeline always
+    # rebuilds it from the latest code. Skipping the workflow for bot
+    # pushes meant the new cluj adapter code (shipped via the bot's
+    # version-bump PR) wouldn't be exercised until the next 00:30 UTC
+    # schedule run -- hours of latency for no real cost savings, since
+    # the pipeline's per-feed ETag skip is what actually decides what
+    # gets rebuilt (and it correctly skips unchanged remote feeds).
+    # Caught 2026-07-13: live cluj SQLite had the _route_tags DDL but
+    # 0 rows even though the GTFS zip carried the data -- the bot's
+    # release PR had landed the new cluj code, but the workflow was
+    # skipped, so the new code was never exercised. Issue #231.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
