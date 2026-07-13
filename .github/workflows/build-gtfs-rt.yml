@@ -23,13 +23,16 @@ permissions:
 
 jobs:
   build:
-    # Skip build when the release bot (n3ary-release-bot) is the actor.
-    # The bot's release/calver-* PRs land on main as a squash merge; the
-    # `push` event fires with `github.actor = n3ary-release-bot[bot]`.
-    # The bot bumps `libs/spec/package.json`, which matches the paths
-    # filter above. A version-only commit would build and push a
-    # byte-identical container image.
-    if: github.actor != 'n3ary-release-bot[bot]'
+    # No `if:` skip. The previous `github.actor != 'n3ary-release-bot[bot]'`
+    # guard assumed a version-only commit produces a byte-identical
+    # container image, but that's wrong when the bot's release PR
+    # includes a dep version bump: pnpm install fetches the new
+    # version, the npm layer hash changes, and the image content
+    # changes. Skipping meant the new code never got into the
+    # published image until the next push. Container layer cache
+    # keeps repeat builds cheap, so the cost of always running is
+    # small. Pairs with the same fix in release-daily-multi-feed.yml.
+    # Issue #231.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
