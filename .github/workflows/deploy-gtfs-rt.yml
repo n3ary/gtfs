@@ -104,6 +104,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Install hcloud + jq
+        # The hcloud CLI is not on the runner by default. We need it
+        # to look up the firewall ID by name in the allow/cleanup
+        # steps below. ops-rebuild-gtfs-rt-vm installs it the same
+        # way. Without this step the deploy has been failing with
+        # `hcloud: command not found` since the rebuild workflow
+        # was forked off (the hcloud install lived only in the
+        # rebuild path).
+        # This step also runs BEFORE the wait step so the
+        # wait step's `jq` calls have a binary to invoke even
+        # if the runner image's preinstalled `jq` is ever
+        # removed.
+        run: |
+          set -euo pipefail
+          curl -sSLo /tmp/hcloud.tar.gz \
+            https://github.com/hetznercloud/cli/releases/download/v1.49.0/hcloud-linux-amd64.tar.gz
+          tar -C /tmp -xzf /tmp/hcloud.tar.gz
+          mv /tmp/hcloud /usr/local/bin/hcloud
+          hcloud version
+          jq --version
+
       - name: Wait for the build workflow to complete
         # The new `push` trigger fires in lockstep with the
         # build, but the build itself runs in a separate
@@ -148,19 +169,12 @@ jobs:
               --commit "$REF_SHA" \
               --json databaseId,status,conclusion,displayTitle \
               --limit 1) || run_json='[]'
-            status=$(printf '%s' "$run_json" | python3 -c '
-              import json,sys
-              d=json.load(sys.stdin)
-              runs=d if isinstance(d, list) else d.get("workflowRuns", [])
-              print(runs[0]["status"] if runs else "none")
-            ')
-            conclusion=$(printf '%s' "$run_json" | python3 -c '
-              import json,sys
-              d=json.load(sys.stdin)
-              runs=d if isinstance(d, list) else d.get("workflowRuns", [])
-              r=runs[0] if runs else {}
-              print(r.get("conclusion") or "none")
-            ')
+            # `jq` is on the runner (the 'Install hcloud + jq'
+            # step above installs it explicitly) and doesn't
+            # have the YAML-indentation trap that bit us in
+            # the previous Python heredoc.
+            status=$(printf '%s' "$run_json" | jq -r 'if length > 0 then .[0].status else "none" end')
+            conclusion=$(printf '%s' "$run_json" | jq -r 'if length > 0 then (.[0].conclusion // "none") else "none" end')
             echo "[wait ${attempt}] build run: status=${status} conclusion=${conclusion}"
             case "${status}:${conclusion}" in
               completed:success)
@@ -182,22 +196,6 @@ jobs:
           done
           echo "::error::build did not complete within ${TIMEOUT_SECONDS}s for ${REF_SHA} - skipping deploy"
           exit 1
-
-      - name: Install hcloud + jq
-        # The hcloud CLI is not on the runner by default. We need it
-        # to look up the firewall ID by name in the allow/cleanup
-        # steps below. ops-rebuild-gtfs-rt-vm installs it the same
-        # way. Without this step the deploy has been failing with
-        # `hcloud: command not found` since the rebuild workflow
-        # was forked off (the hcloud install lived only in the
-        # rebuild path).
-        run: |
-          set -euo pipefail
-          curl -sSLo /tmp/hcloud.tar.gz \
-            https://github.com/hetznercloud/cli/releases/download/v1.49.0/hcloud-linux-amd64.tar.gz
-          tar -C /tmp -xzf /tmp/hcloud.tar.gz
-          mv /tmp/hcloud /usr/local/bin/hcloud
-          hcloud version
 
       - name: Allow this GH runner's IP on the firewall (temporary)
         # Same pattern as rebuild-gtfs-rt-vm: the base firewall
