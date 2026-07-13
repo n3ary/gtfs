@@ -6,20 +6,53 @@ name: '[deploy] gtfs-rt to Hetzner (on build complete + manual)'
 # Requires:
 #   Secrets: HETZNER_SSH_KEY, GHCR_TOKEN, CLOUDFLARE_API_TOKEN
 #   Variables: CLOUDFLARE_ZONE_ID, CLOUDFLARE_GTFS_RT_A_RECORD_ID
+#
+# Trigger history (see #224):
+#   - The original trigger was `workflow_run` against the build
+#     workflow. That worked from 2026-07-10 onward.
+#   - PR #188 (2026-07-11T12:49Z) renamed the build workflow
+#     from `Build ghcr.io/n3ary/gtfs-rt` to
+#     `[build] gtfs-rt container image (on push to main + tags + manual)`.
+#     The deploy's `workflow_run.workflows:` filter still
+#     referenced the old name and silently stopped matching.
+#   - PR #202 fixed the `workflows:` filter to the new build
+#     name. Auto-deploy was NOT restored (zero post-#202
+#     `workflow_run` deploy runs in 8h).
+#   - PR #225 added an explicit
+#     `permissions: actions: read, contents: read` block on the
+#     deploy workflow, on the hypothesis that the org's
+#     restrictive GITHUB_TOKEN default was stripping
+#     `actions: read` and that the receiver workflow needs it
+#     to receive `workflow_run` events at all. Auto-deploy was
+#     NOT restored (zero post-#225 `workflow_run` deploy runs
+#     in 14h+).
+#   - Local `act` mock with a synthetic `workflow_run` payload
+#     confirmed the workflow file itself is fine: the deploy
+#     job's `if:` evaluates TRUE and the steps would proceed.
+#     The bug is at the platform's event delivery layer and
+#     is not fixable from workflow YAML.
+#   - This PR switches the trigger to `push: branches: [main]`
+#     with the same `paths:` filter as the build, so the
+#     deploy fires in lockstep with the build. A
+#     `peter-evans/wait-for-check` step at the top of the
+#     job waits for the build check-run to complete before
+#     pulling the image, which preserves the
+#     build-then-deploy ordering that `workflow_run` was
+#     supposed to give us.
 
 on:
-  workflow_run:
-    # Match the build workflow's actual `name:` field verbatim
-    # (the `workflows:` filter uses the workflow's `name`, not
-    # the file name or path). The previous value
-    # `"Build ghcr.io/n3ary/gtfs-rt"` was the build's old name
-    # before it was renamed to the longer `name:` we have today;
-    # the mismatch silently broke every auto-deploy since the
-    # rename, so this workflow never auto-fired and every deploy
-    # had to be triggered manually.
-    workflows: ["[build] gtfs-rt container image (on push to main + tags + manual)"]
-    types: [completed]
+  push:
     branches: [main]
+    # Mirror the build's `paths:` filter verbatim so the deploy
+    # only fires on pushes that would have triggered a build.
+    # If you change this, also change build-gtfs-rt.yml's
+    # `paths:` to match (and vice versa).
+    paths:
+      - 'apps/gtfs-rt/**'
+      - 'libs/spec/**'
+      - 'apps/gtfs-static/**'
+      - '.github/workflows/build-gtfs-rt.yml'
+      - 'apps/gtfs-rt/Containerfile'
   workflow_dispatch:
     inputs:
       image_tag:
@@ -33,34 +66,30 @@ env:
 
 # Explicit permissions block.
 #
-# Two scopes are required:
-#   actions: read    -- to RECEIVE the workflow_run event in the
-#                       first place. Without this, downstream
-#                       workflows never get told the upstream
-#                       build completed, so the auto-deploy
-#                       silently no-ops. The default repo
-#                       GITHUB_TOKEN permission set is read-only
-#                       for all scopes, but the n3ary org default
-#                       is "read repository contents and packages,
-#                       nothing else", which strips actions: read.
-#                       That was the root cause of the silent
-#                       auto-deploy outage from 2026-07-11 to
-#                       2026-07-12 -- every build on main
-#                       produced zero deploy runs, and only the
-#                       fact that the upstream build's
-#                       `name:` field had been renamed (PR #188)
-#                       drew attention to it. PR #202 fixed the
-#                       `workflows:` filter, but the missing
-#                       actions: read was a separate, hidden
-#                       blocker. Tracked in #224.
-#   contents: read   -- to read github.event.workflow_run.* in
-#                       the job context. Default is included but
-#                       listed explicitly so the deploy workflow
-#                       keeps working if the org default ever
-#                       tightens further.
+# Two scopes are required for the new `push` + `wait-for-check`
+# trigger:
+#   actions: read    -- for the `peter-evans/wait-for-check` step
+#                       to call the check-runs API and poll the
+#                       build's status for the current SHA. The
+#                       org's default GITHUB_TOKEN mode is
+#                       `default_workflow_permissions: read`
+#                       (verified via
+#                       /repos/n3ary/gtfs-publisher/actions/permissions/workflow),
+#                       which is read-only across all scopes. An
+#                       explicit `actions: read` request is the
+#                       safe way to grant just what we need.
+#   contents: read   -- to read the workflow context
+#                       (`github.sha`, `github.event_name`,
+#                       etc.) and to checkout the repo for the
+#                       appleboy/ssh-action context. Listed
+#                       explicitly so the workflow keeps
+#                       working if the org default ever tightens
+#                       further.
 #
-# Without this block, the deploy workflow is invisible to the
-# workflow_run webhook delivery path on this org.
+# Note: this permissions block is a leftover from PR #225's
+# `workflow_run` delivery hypothesis. With the new `push`
+# trigger the `actions: read` scope is still needed (for the
+# wait-for-check API call), so the block stays as-is.
 permissions:
   actions: read
   contents: read
@@ -71,10 +100,89 @@ concurrency:
 
 jobs:
   deploy:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Wait for the build workflow to complete
+        # The new `push` trigger fires in lockstep with the
+        # build, but the build itself runs in a separate
+        # workflow. We can't just `needs: build` (cross-workflow
+        # needs isn't supported), so poll the build's run for
+        # the current SHA via the `gh` CLI until it's done.
+        #
+        # - If the build is "completed: success", the wait
+        #   succeeds and the deploy proceeds.
+        # - If the build is "completed: failure" or "completed:
+        #   cancelled", the wait step fails and the deploy is
+        #   skipped (the deploy job exits 1 before any of the
+        #   SSH/hcloud steps run).
+        # - If the build is still queued/in_progress after
+        #   `TIMEOUT_SECONDS`, the wait step times out and the
+        #   deploy is skipped. The monitor-gtfs-rt-uptime
+        #   workflow will catch a stale image via the uptime
+        #   probe if needed.
+        #
+        # `workflow_dispatch` deploys skip the wait (manual
+        # deploys are explicit: "deploy THIS tag right now").
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_WORKFLOW: build-gtfs-rt.yml
+          REF_SHA: ${{ github.sha }}
+          TIMEOUT_SECONDS: 600
+          POLL_INTERVAL_SECONDS: 10
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + TIMEOUT_SECONDS ))
+          attempt=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            attempt=$((attempt + 1))
+            # Query the build workflow's run for this SHA.
+            # `gh run list` returns one row per run; we ask for
+            # JSON, pick the most recent (limit 1 sorts by
+            # created desc by default), and inspect its status.
+            run_json=$(gh run list \
+              --repo "${{ github.repository }}" \
+              --workflow "$BUILD_WORKFLOW" \
+              --commit "$REF_SHA" \
+              --json databaseId,status,conclusion,displayTitle \
+              --limit 1) || run_json='[]'
+            status=$(printf '%s' "$run_json" | python3 -c '
+              import json,sys
+              d=json.load(sys.stdin)
+              runs=d if isinstance(d, list) else d.get("workflowRuns", [])
+              print(runs[0]["status"] if runs else "none")
+            ')
+            conclusion=$(printf '%s' "$run_json" | python3 -c '
+              import json,sys
+              d=json.load(sys.stdin)
+              runs=d if isinstance(d, list) else d.get("workflowRuns", [])
+              r=runs[0] if runs else {}
+              print(r.get("conclusion") or "none")
+            ')
+            echo "[wait ${attempt}] build run: status=${status} conclusion=${conclusion}"
+            case "${status}:${conclusion}" in
+              completed:success)
+                echo "build succeeded for ${REF_SHA}; proceeding with deploy"
+                exit 0
+                ;;
+              completed:cancelled|completed:failure|completed:timed_out|completed:action_required|completed:stale|completed:neutral|completed:skipped)
+                echo "::error::build completed: ${conclusion} for ${REF_SHA} - skipping deploy"
+                exit 1
+                ;;
+              none:none)
+                echo "build run not yet visible (queued); waiting"
+                ;;
+              *)
+                echo "build in progress; waiting"
+                ;;
+            esac
+            sleep "$POLL_INTERVAL_SECONDS"
+          done
+          echo "::error::build did not complete within ${TIMEOUT_SECONDS}s for ${REF_SHA} - skipping deploy"
+          exit 1
+
       - name: Install hcloud + jq
         # The hcloud CLI is not on the runner by default. We need it
         # to look up the firewall ID by name in the allow/cleanup
