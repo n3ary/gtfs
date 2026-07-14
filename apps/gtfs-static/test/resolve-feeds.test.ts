@@ -149,9 +149,9 @@ describe('resolve-feeds: end-to-end merge', () => {
   it('publishes a feed with per-feed config: rewrites vehicle_positions, fills upstream_vehicle_positions from MDB', async () => {
     // Transitous ro.json: a single Cluj-Napoca schedule source with
     // an RT sibling (same `name`, `spec: "gtfs-rt"`) carrying an
-    // mdb-id, and a Tursib source with no RT. The RT sibling shares
-    // the schedule feed's name -- that's how resolveRealtimeForName
-    // pairs them.
+    // mdb-id, a Tursib source with no RT, and an Oradea source (OTL SA,
+    // mdb-2101). The RT sibling shares the schedule feed's name -- that's
+    // how resolveRealtimeForName pairs them.
     const transitousPayload = {
       sources: [
         {
@@ -171,6 +171,11 @@ describe('resolve-feeds: end-to-end merge', () => {
           type: 'http',
           url: 'https://gtfs.tursib.ro/gtfs.zip',
           license: { 'spdx-identifier': 'CC-BY-SA-4.0' },
+        },
+        {
+          name: 'Oradea',
+          type: 'mobility-database',
+          'mdb-id': '2101',
         },
       ],
     };
@@ -234,13 +239,15 @@ describe('resolve-feeds: end-to-end merge', () => {
   });
 
   it('throws when a per-feed config enhances a name not in Transitous', async () => {
-    // No Transitous sources for RO at all. Tursib's per-feed
-    // config (real file on disk) enhances "Tursib" but there's
-    // no Transitous match -- orphan error.
+    // Only Oradea is covered; Cluj-Napoca and Tursib per-feed configs
+    // (real files on disk) have no Transitous match -- orphan error
+    // lists them alphabetically: cluj-napoca, tursib.
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('transitous') && url.endsWith('/ro.json')) {
-        return new Response(JSON.stringify({ sources: [] }));
+        return new Response(JSON.stringify({
+          sources: [{ name: 'Oradea', type: 'mobility-database', 'mdb-id': '2101' }],
+        }));
       }
       throw new Error(`unexpected fetch: ${url}`);
     }) as never;
